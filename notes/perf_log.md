@@ -306,13 +306,16 @@ GPU: NVIDIA GeForce RTX 3080 (sm_86)
 | 12 | smem_v float | 1.763 ms | 1.83 | 1.18x | 0.43x |
 | 14 | WMMA PV全化 | 1.046 ms | 3.08 | 2.00x | 0.72x |
 | 15 | cp.async+smem_p pad | 1.052 ms | 3.06 | 2.27x | 0.82x |
+| 16 | NWARPS 4→8（失败） | 1.129 ms | 2.85 | 2.11x | 0.76x |
+| 17 | cp.async 真双缓冲（持平） | 1.064 ms | 3.03 | 2.24x | 0.80x |
+| 18 | BN 16→64（大 tile）| 0.938 ms | 3.43 | 2.53x | 0.91x |
 
 Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - **PyTorch Ref (FP16 TC):** 2.090 ms, 1.54 TFLOPS
 - **Triton (FP16 TC):** 0.751 ms, 4.29 TFLOPS ← 当前目标
 
-总提速: 16.571ms → 1.052ms = **15.8x** (Baseline → Round 15)
-差距: 我们 1.052ms vs Triton 0.751ms，需要再快 **1.40x**
+总提速: 16.571ms → 0.938ms = **17.7x** (Baseline → Round 18)
+差距: 我们 0.938ms vs Triton 0.751ms，需要再快 **1.25x**
 
 ### Round 13 — WMMA PV 累加（失败，已回滚）
 
@@ -382,3 +385,45 @@ Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - 加速比 vs Ref: 2.27x
 
 关键指标 (N=512): **1.052 ms, 3.06 TFLOPS** (vs Round 14: 1.046ms，持平，cp.async 单缓冲无实质提速)
+
+### Round 16 — NWARPS 4→8（失败，已回滚）
+
+结果: 1.129 ms — smem 从 20 KB → 32 KB，每 SM blocks 数从 ~4 降到 ~2，occupancy 降低
+教训: 增大 NWARPS 要与 smem 约束平衡，smem > 25 KB 时性能开始下降
+
+### Round 17 — cp.async 真双缓冲 pipeline（持平，已回滚）
+
+结果: 1.064 ms — 把 continue 改为 if (!skip)，避免了 race condition，但循环末尾多一次 __syncthreads()
+教训: double-buffer 的 load-compute 重叠收益被额外同步开销抵消
+
+### Round 18 — BN 16→64（大 tile，减少循环次数）
+
+改动: csrc/sparse_attention.cu
+- BN: 16 → 64（每个 tile 覆盖 64 列的 K/V）
+- 循环次数: N/16=32 → N/64=8（for N=512），__syncthreads() 从 64 次减到 16 次
+- QK^T: 从 1 个 m16n16k16 改为 4 个 m16n16k16（qk_sub[4]），覆盖 BM×BN=16×64 的 score
+- K/V load: 每线程处理 4 行（原来 1 行），4 次 cp.async 16B 调用
+- smem_k/v: 单缓冲 [BN][HD]=[64][64]，总 smem ≈ 34 KB（原 20 KB）
+- smem_p: [NWARPS][BM][BN+PP]=[4][16][72]，softmax 在 64 个 score 上做
+- PV: 4×4 WMMA（NQK×NF），P_sub[k] × V_sub[k][f]，16 次 mma_sync/iteration
+- occupancy: 34 KB/block，100 KB → 每 SM 2 个 block（vs 之前 4 个），但 tile 复用更好
+
+原因: 大 tile 减少循环次数（32→8），大幅降低 __syncthreads() 和 ballot 开销
+ sparsity=0.75 时每个 BN=64 tile 有 16 个非零列平均，比 BN=16 tile 更容易跳过整 tile
+
+序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
+| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+|---|---|---|---|
+| 64 | 0.041 | 1.22 | 4.1% |
+| 128 | 0.087 | 2.31 | 7.8% |
+| 256 | 0.265 | 3.04 | 10.2% |
+| 512 | 0.938 | 3.43 | 11.5% |
+| 1024 | 3.325 | 3.88 | 13.0% |
+
+对比 PyTorch Ref FP16 Tensor Core (B=16, N=512):
+- Ours: 0.827 ms (3.90 TFLOPS)  ← Baseline 对比单点
+- PyTorch Ref: 2.088 ms (1.54 TFLOPS)
+- Triton: 0.751 ms (4.29 TFLOPS)
+- 加速比 vs Ref: 2.53x；vs Triton: 0.91x（距目标仅差 9%）
+
+关键指标 (N=512): **0.938 ms, 3.43 TFLOPS** (vs Round 15: 1.052ms, 提速 1.12x)

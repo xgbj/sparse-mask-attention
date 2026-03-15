@@ -22,6 +22,7 @@ rounds = [
     (12, "R12 smem_v f32",   1.763, 1.83),
     (14, "R14 WMMA PV",      1.046, 3.08),
     (15, "R15 cp.async",     1.052, 3.06),
+    (18, "R18 BN=64",        0.938, 3.43),
 ]
 
 r_ids   = [r[0]  for r in rounds]
@@ -72,7 +73,7 @@ ax.grid(axis='y', alpha=0.4, zorder=1)
 leg_patches = [
     mpatches.Patch(color='#4C72B0', label='Scalar optimization (R0–R8)'),
     mpatches.Patch(color='#DD8452', label='WMMA QK^T (R9–R12)'),
-    mpatches.Patch(color='#55A868', label='WMMA QK+PV (R14–R15)'),
+    mpatches.Patch(color='#55A868', label='WMMA QK+PV (R14–R18)'),
 ]
 ax.legend(handles=leg_patches + ax.get_legend_handles_labels()[0][::-1],
           fontsize=8, loc='upper right')

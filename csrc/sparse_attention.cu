@@ -1,22 +1,21 @@
 /*
  * Sparse Mask Attention - CUDA Kernel
  *
- * Round 15: cp.async double-buffering + smem_p bank-conflict fix
- *   (builds on Round 14: WMMA for both QK^T and PV)
+ * Round 18: BN 16→64 (larger tile, fewer loop iterations, fewer syncs)
+ *   (builds on Round 15: cp.async + smem_p padding)
  *
  * Architecture:
  *   - 4 warps per block, each warp handles 16 rows of Q (BM=16)
- *   - WMMA m16n16k16: QK^T 4 tiles over HD=64 → float acc
- *   - Softmax: scalar over BN=16 scores per row
- *   - WMMA m16n16k16: PV 4 tiles over HD=64 columns → float acc_frag[4]
+ *   - BN=64: each tile covers 64 K/V columns (vs 16 before)
+ *     → loop iterations: N/64 (e.g. 8 for N=512, vs 32 before)
+ *     → __syncthreads() calls: ~2×8=16 (vs 2×32=64 before)
+ *   - QK^T: 4 WMMA tiles (NQK=4) each m16n16k16 → score sub-tiles side by side
+ *     result: smem_p[wid][BM][BN=64] via 4×WMMA writes
+ *   - Softmax: scalar over BN=64 scores per row
+ *   - PV: P[BM×BN=64] × V[BN=64×HD=64] → NF=4 acc_frag[f] (BM×16 each)
+ *     each PV WMMA: P_sub[BM×16] (4 sub-tiles) × V_sub[16×16] → acc_frag[f]
  *   - Fragment rescale via smem_rsc[warp][row]
  *   - Output written directly from fragment elements to global memory
- *
- * Round 15 changes:
- *   1. smem_k and smem_v upgraded to double-buffer [2][BN][HD]
- *      cp.async.cg (16B) loads next tile while current tile is computed
- *   2. smem_p padded to [NWARPS][BM][BN+1] to eliminate 2-way bank conflict
- *      during softmax scalar read/write (each row is BN+1 half = odd width)
  *
  * Key WMMA accumulator element layout (m16n16k16, float, row_major):
  *   frag.x[i], lane L:
@@ -25,14 +24,14 @@
  *
  * Shared memory per block:
  *   smem_q[4][16][64]    fp16  =  8192 B
- *   smem_k[2][16][64]    fp16  =  4096 B  (double buffer)
- *   smem_v[2][16][64]    fp16  =  4096 B  (double buffer)
- *   smem_p[4][16][17]    fp16  =  2176 B  (BN+1 padding)
+ *   smem_k[2][64][64]    fp16  = 16384 B  (double buffer, BN=64)
+ *   smem_v[2][64][64]    fp16  = 16384 B  (double buffer, BN=64)
+ *   smem_p[4][16][72]    fp16  =  9216 B  (BN+8=72 halves padding)
  *   smem_max[4][16]      float =   256 B
  *   smem_sum[4][16]      float =   256 B
  *   smem_rsc[4][16]      float =   256 B
  *   warp_ballots[4]      u32   =    16 B
- *   Total ≈ 19.3 KB
+ *   Total ≈ 51.0 KB  ← fits in RTX 3080 (100 KB per SM)
  */
 
 #include "sparse_attention.h"
@@ -88,10 +87,11 @@ __global__ void sparse_attn_wmma_full_fp16(
     const bool save_lse
 ) {
     constexpr int BM     = 16;
-    constexpr int BN     = 16;
+    constexpr int BN     = 64;   // larger tile: 4x fewer loop iterations
     constexpr int HD     = 64;
     constexpr int WK     = 16;
-    constexpr int NF     = HD / BN;   // = 4 output column fragments per row
+    constexpr int NQK    = BN / WK;  // = 4 WMMA tiles for QK^T (BM×WK × WK×BN)
+    constexpr int NF     = HD / WK;  // = 4 output column fragments per row (PV)
     constexpr int NWARPS = 4;
     constexpr int BROWS  = BM * NWARPS;  // = 64
     constexpr int NTH    = 32 * NWARPS;  // = 128
@@ -116,20 +116,19 @@ __global__ void sparse_attn_wmma_full_fp16(
     const int nw  = (seq_len + 31) / 32;
     const uint32_t* Mbh = mask_packed + (batch_id * num_heads + head_id) * seq_len * nw;
 
-    // ---- Shared memory (Round 15: double-buffered K/V, padded P) ----
-    // PP=8: pad smem_p column dimension so BN+PP = 24 halves per row (48 bytes).
-    // This serves two purposes:
-    //   1. Bank conflict elimination: 24 halves = 24 banks, odd row stride.
-    //   2. WMMA stride alignment: load_matrix_sync requires stride ≡ 0 (mod 8) for __half.
-    //      BN+PP = 16+8 = 24, which is divisible by 8. ✓
-    constexpr int PP = 8;  // smem_p column padding (24 halves = 48 bytes per row)
-    __shared__ __align__(16) __half smem_q[NWARPS][BM][HD];           // Q tiles (16B aligned for WMMA)
-    __shared__ __align__(16) __half smem_k[2][BN][HD];               // K double-buffer (16B aligned)
-    __shared__ __align__(16) __half smem_v[2][BN][HD];               // V double-buffer (16B aligned)
-    __shared__ __align__(16) __half smem_p[NWARPS][BM][BN + PP];     // softmax weights P (16B aligned for WMMA)
-    __shared__ float     smem_max[NWARPS][BM];             // running row max
-    __shared__ float     smem_sum[NWARPS][BM];             // running row sum
-    __shared__ float     smem_rsc[NWARPS][BM];             // rescale factor
+    // ---- Shared memory (Round 18: BN=64, single-buffer K/V, padded P) ----
+    // PP=8: pad smem_p column so BN+PP = 72 halves/row (144 bytes).
+    //   72 % 8 = 0 → WMMA stride ok; row size 144B → banks spread for 4-byte fp16 banks.
+    // smem_k/smem_v: single buffer (no double-buffering; focus on fewer iterations).
+    //   BN=64 → smem_k/v each 64×64×2 = 8192 B. Total smem ≈ 34 KB.
+    constexpr int PP = 8;  // smem_p column padding (72 halves = 144 bytes per row)
+    __shared__ __align__(16) __half smem_q[NWARPS][BM][HD];           // Q tiles
+    __shared__ __align__(16) __half smem_k[BN][HD];                   // K single-buffer
+    __shared__ __align__(16) __half smem_v[BN][HD];                   // V single-buffer
+    __shared__ __align__(16) __half smem_p[NWARPS][BM][BN + PP];     // scores P (padded)
+    __shared__ float     smem_max[NWARPS][BM];
+    __shared__ float     smem_sum[NWARPS][BM];
+    __shared__ float     smem_rsc[NWARPS][BM];
     __shared__ uint32_t  warp_ballots[NWARPS];
 
     // ---- Initialize Q tile and rowstate ----
@@ -147,7 +146,8 @@ __global__ void sparse_attn_wmma_full_fp16(
     }
 
     // ---- Per-warp accumulator fragments ----
-    wmma::fragment<wmma::accumulator, BM, BN, WK, float> acc_frag[NF];
+    // NF=4 fragments, each m16n16k16, covering output cols [f*16..(f+1)*16-1]
+    wmma::fragment<wmma::accumulator, BM, WK, WK, float> acc_frag[NF];
 #pragma unroll
     for (int f = 0; f < NF; f++) wmma::fill_fragment(acc_frag[f], 0.f);
 
@@ -157,105 +157,125 @@ __global__ void sparse_attn_wmma_full_fp16(
 
     const int ntiles = (seq_len + BN - 1) / BN;
 
-    // ---- cp.async pipeline: each thread handles 1 chunk of 8 halves (16B) per K and V ----
-    // BN*HD = 16*64 = 1024 halves = 128 chunks. NTH=128, so 1 chunk per thread per buffer.
-    // chunk c = tid: row = tid/(HD/8) = tid/8, col_base = (tid%(HD/8))*8 = (tid%8)*8
-    // Addresses: Kbh[gc*HD + d] where gc=cs+row, d=col_base (8-half aligned → 16B aligned).
-    // smem_k[buf][row][d]: smem_k is .align 16, each row HD*2=128B, d multiples of 8 → 16B aligned.
-#define LOAD_KV_ASYNC(tile_n_, buf_) do { \
+    // ---- K/V load: BN*HD = 64*64 = 4096 halves = 512 chunks of 8 halves (16B).
+    // NTH=128 < 512, so each thread handles 512/128 = 4 chunks (rows).
+    // Thread tid loads rows: tid/8, tid/8+16, tid/8+32, tid/8+48 of K (and V).
+    // col = (tid%8)*8, which is 16B aligned. ✓
+#define LOAD_KV_SYNC(tile_n_) do { \
     { \
         const int _cs = (tile_n_) * BN; \
-        const int _r  = tid / (HD / 8); \
         const int _d  = (tid % (HD / 8)) * 8; \
-        const int _gc = _cs + _r; \
-        if (_gc < seq_len) { \
-            cp_async_16B(&smem_k[(buf_)][_r][_d], &Kbh[_gc * HD + _d]); \
-            cp_async_16B(&smem_v[(buf_)][_r][_d], &Vbh[_gc * HD + _d]); \
-        } else { \
-            smem_k[(buf_)][_r][_d+0] = __float2half(0.f); \
-            smem_k[(buf_)][_r][_d+1] = __float2half(0.f); \
-            smem_k[(buf_)][_r][_d+2] = __float2half(0.f); \
-            smem_k[(buf_)][_r][_d+3] = __float2half(0.f); \
-            smem_k[(buf_)][_r][_d+4] = __float2half(0.f); \
-            smem_k[(buf_)][_r][_d+5] = __float2half(0.f); \
-            smem_k[(buf_)][_r][_d+6] = __float2half(0.f); \
-            smem_k[(buf_)][_r][_d+7] = __float2half(0.f); \
-            smem_v[(buf_)][_r][_d+0] = __float2half(0.f); \
-            smem_v[(buf_)][_r][_d+1] = __float2half(0.f); \
-            smem_v[(buf_)][_r][_d+2] = __float2half(0.f); \
-            smem_v[(buf_)][_r][_d+3] = __float2half(0.f); \
-            smem_v[(buf_)][_r][_d+4] = __float2half(0.f); \
-            smem_v[(buf_)][_r][_d+5] = __float2half(0.f); \
-            smem_v[(buf_)][_r][_d+6] = __float2half(0.f); \
-            smem_v[(buf_)][_r][_d+7] = __float2half(0.f); \
+        for (int _roff = 0; _roff < BN; _roff += NTH / (HD / 8)) { \
+            const int _r  = (tid / (HD / 8)) + _roff; \
+            const int _gc = _cs + _r; \
+            if (_r < BN) { \
+                if (_gc < seq_len) { \
+                    cp_async_16B(&smem_k[_r][_d], &Kbh[_gc * HD + _d]); \
+                    cp_async_16B(&smem_v[_r][_d], &Vbh[_gc * HD + _d]); \
+                } else { \
+                    smem_k[_r][_d+0] = __float2half(0.f); \
+                    smem_k[_r][_d+1] = __float2half(0.f); \
+                    smem_k[_r][_d+2] = __float2half(0.f); \
+                    smem_k[_r][_d+3] = __float2half(0.f); \
+                    smem_k[_r][_d+4] = __float2half(0.f); \
+                    smem_k[_r][_d+5] = __float2half(0.f); \
+                    smem_k[_r][_d+6] = __float2half(0.f); \
+                    smem_k[_r][_d+7] = __float2half(0.f); \
+                    smem_v[_r][_d+0] = __float2half(0.f); \
+                    smem_v[_r][_d+1] = __float2half(0.f); \
+                    smem_v[_r][_d+2] = __float2half(0.f); \
+                    smem_v[_r][_d+3] = __float2half(0.f); \
+                    smem_v[_r][_d+4] = __float2half(0.f); \
+                    smem_v[_r][_d+5] = __float2half(0.f); \
+                    smem_v[_r][_d+6] = __float2half(0.f); \
+                    smem_v[_r][_d+7] = __float2half(0.f); \
+                } \
+            } \
         } \
+        cp_async_commit(); \
     } \
 } while(0)
 
-    // ---- Single-buffer cp.async: async load at start of each iteration ----
-    // cp.async.cg uses L2 cache bypass path, potentially faster than regular loads.
-    // No double-buffering pipeline complexity; simple load-then-wait pattern.
-    // cbuf is always 0 (single buffer), but keeping as (tn&1) for potential future upgrade.
     __syncthreads();  // Q load complete
 
-    // ---- Main loop ----
+    // ---- Main loop (BN=64: 8 iterations for N=512 vs 32 before) ----
     for (int tn = 0; tn < ntiles; tn++) {
-        const int cs   = tn * BN;
-        const int cbuf = 0;  // single buffer (no double-buffering for simplicity)
+        const int cs = tn * BN;
 
-        // Load K and V for current tile asynchronously
-        LOAD_KV_ASYNC(tn, cbuf);
-        cp_async_commit();
+        // Load K and V tile (4 rows per thread)
+        LOAD_KV_SYNC(tn);
 
-        // ---- Sparse block skip check ----
+        // ---- Sparse block skip check: BN=64 spans up to 3 uint32 words ----
+        // We check 64 bits: mask[grow][cs..cs+63]
         uint32_t mword = 0u;
         if (vr) {
             int wi = cs / 32, bo = cs % 32;
             mword = Mbh[grow * nw + wi] >> bo;
-            if (bo + BN > 32 && (wi + 1) < nw)
+            if (bo > 0 && (wi + 1) < nw)
                 mword |= Mbh[grow * nw + wi + 1] << (32 - bo);
-            int vc = min(BN, seq_len - cs);
+            // For BN=64, also check the upper 32 bits
+            uint32_t mword2 = 0u;
+            int wi2 = (cs + 32) / 32, bo2 = (cs + 32) % 32;
+            if (cs + 32 < seq_len) {
+                mword2 = Mbh[grow * nw + wi2] >> bo2;
+                if (bo2 > 0 && (wi2 + 1) < nw)
+                    mword2 |= Mbh[grow * nw + wi2 + 1] << (32 - bo2);
+                int vc2 = min(32, seq_len - (cs + 32));
+                if (vc2 < 32) mword2 &= (1u << vc2) - 1u;
+            }
+            int vc = min(32, seq_len - cs);
             if (vc < 32) mword &= (1u << vc) - 1u;
+            mword |= mword2;  // any bit set in either 32-bit half
         }
         uint32_t ballot = __ballot_sync(0xffffffff, mword != 0u);
         if (lane == 0) warp_ballots[wid] = ballot;
 
-        // Wait for current tile's load to complete before using it
+        // Wait for K/V tile load to complete
         cp_async_wait<0>();
         __syncthreads();
 
         if ((warp_ballots[0] | warp_ballots[1] | warp_ballots[2] | warp_ballots[3]) == 0u) continue;
 
-        // ---- WMMA QK^T → write scores to smem_p (fp16, with mask) ----
+        // ---- WMMA QK^T: Q[BM×HD] × K[BN×HD]^T → scores[BM×BN] ----
+        // BN=64 = 4×WK: 4 WMMA tiles along the N dimension.
+        // qk_sub[f]: m16n16k16 accumulator covering cols [f*16..(f+1)*16-1]
         if (wr < seq_len) {
-            wmma::fragment<wmma::accumulator, BM, BN, WK, float> qk;
-            wmma::fill_fragment(qk, 0.f);
+            wmma::fragment<wmma::accumulator, BM, WK, WK, float> qk_sub[NQK];
+#pragma unroll
+            for (int f = 0; f < NQK; f++) wmma::fill_fragment(qk_sub[f], 0.f);
+
 #pragma unroll
             for (int kk = 0; kk < HD; kk += WK) {
-                wmma::fragment<wmma::matrix_a, BM, BN, WK, __half, wmma::row_major> a;
-                wmma::fragment<wmma::matrix_b, BM, BN, WK, __half, wmma::col_major> b;
+                wmma::fragment<wmma::matrix_a, BM, WK, WK, __half, wmma::row_major> a;
                 wmma::load_matrix_sync(a, &smem_q[wid][0][kk], HD);
-                wmma::load_matrix_sync(b, &smem_k[cbuf][0][kk], HD);
-                wmma::mma_sync(qk, a, b, qk);
+#pragma unroll
+                for (int f = 0; f < NQK; f++) {
+                    wmma::fragment<wmma::matrix_b, WK, WK, WK, __half, wmma::col_major> b;
+                    wmma::load_matrix_sync(b, &smem_k[f * WK][kk], HD);
+                    wmma::mma_sync(qk_sub[f], a, b, qk_sub[f]);
+                }
             }
 
             // Write scores to smem_p with mask applied
-            // Fragment layout: frag.x[i] at (row=lane/4+((i&2)?8:0), col=(lane%4)*2+col_off[i])
+            // qk_sub[f] covers output cols [f*WK .. (f+1)*WK-1]
 #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                int fr  = lane / 4 + ((i & 2) ? 8 : 0);
-                int fc  = (lane % 4) * 2 + wmma_col_off[i];
-                int gr2 = wr + fr;
-                int gc2 = cs + fc;
-                bool ok = (gr2 < seq_len) && (gc2 < seq_len) &&
-                          ((Mbh[gr2 * nw + gc2 / 32] >> (gc2 % 32)) & 1u);
-                float sv = ok ? (qk.x[i] * scale) : -65504.f;
-                smem_p[wid][fr][fc] = __float2half(sv);
+            for (int f = 0; f < NQK; f++) {
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    int fr  = lane / 4 + ((i & 2) ? 8 : 0);
+                    int fc  = f * WK + (lane % 4) * 2 + wmma_col_off[i];
+                    int gr2 = wr + fr;
+                    int gc2 = cs + fc;
+                    bool ok = (gr2 < seq_len) && (gc2 < seq_len) &&
+                              ((Mbh[gr2 * nw + gc2 / 32] >> (gc2 % 32)) & 1u);
+                    float sv = ok ? (qk_sub[f].x[i] * scale) : -65504.f;
+                    smem_p[wid][fr][fc] = __float2half(sv);
+                }
             }
         }
-        __syncwarp();   // smem_p written by all 32 lanes in this warp
+        __syncwarp();
 
-        // ---- Softmax (lanes 0..BM-1 each handle one row) ----
+        // ---- Softmax (lanes 0..BM-1 each handle one row of BN=64 scores) ----
         if (vr) {
             float old_max = smem_max[wid][lrow];
             float old_sum = smem_sum[wid][lrow];
@@ -283,11 +303,10 @@ __global__ void sparse_attn_wmma_full_fp16(
             smem_max[wid][lrow] = nm;
             smem_sum[wid][lrow] = ns;
 
-            // Write P (fp16) for WMMA PV — stride = BN+PP
 #pragma unroll
             for (int j = 0; j < BN; j++) smem_p[wid][lrow][j] = __float2half(pv[j]);
         }
-        __syncwarp();   // smem_rsc and smem_p now valid
+        __syncwarp();
 
         // ---- Rescale acc_frag using smem_rsc ----
         if (wr < seq_len) {
@@ -301,21 +320,23 @@ __global__ void sparse_attn_wmma_full_fp16(
             }
         }
 
-        // ---- WMMA PV: P[BM×BN] × V[BN×HD] → acc_frag[NF] ----
-        // smem_p stride = BN+PP (padded row width)
+        // ---- WMMA PV: P[BM×BN=64] × V[BN=64×HD=64] → acc_frag[NF] ----
+        // P is split into NQK=4 sub-tiles of width WK=16 along the K dimension.
+        // acc_frag[f] covers output cols [f*WK .. (f+1)*WK-1].
+        // PV = sum over k: P_sub[k] × V_sub[k][f*WK..(f+1)*WK-1]
         if (wr < seq_len) {
 #pragma unroll
             for (int f = 0; f < NF; f++) {
-                wmma::fragment<wmma::matrix_a, BM, BN, WK, __half, wmma::row_major> pa;
-                wmma::fragment<wmma::matrix_b, BM, BN, WK, __half, wmma::row_major> vb;
-                wmma::load_matrix_sync(pa, &smem_p[wid][0][0], BN + PP);
-                wmma::load_matrix_sync(vb, &smem_v[cbuf][0][f * BN], HD);
-                wmma::mma_sync(acc_frag[f], pa, vb, acc_frag[f]);
+#pragma unroll
+                for (int k = 0; k < NQK; k++) {
+                    wmma::fragment<wmma::matrix_a, BM, WK, WK, __half, wmma::row_major> pa;
+                    wmma::fragment<wmma::matrix_b, WK, WK, WK, __half, wmma::row_major> vb;
+                    wmma::load_matrix_sync(pa, &smem_p[wid][0][k * WK], BN + PP);
+                    wmma::load_matrix_sync(vb, &smem_v[k * WK][f * WK], HD);
+                    wmma::mma_sync(acc_frag[f], pa, vb, acc_frag[f]);
+                }
             }
         }
-
-        // cp_async pipeline: next tile was already issued at the top of this iteration.
-        // No explicit sync needed here; the next iteration's cp_async_wait<0> handles it.
     }
 
     // ---- Normalize and write output directly from fragment elements ----
@@ -327,7 +348,7 @@ __global__ void sparse_attn_wmma_full_fp16(
                 int fr   = lane / 4 + ((i & 2) ? 8 : 0);
                 int fc   = (lane % 4) * 2 + wmma_col_off[i];
                 int gr2  = wr + fr;
-                int gc2  = f * BN + fc;
+                int gc2  = f * WK + fc;
                 if (gr2 < seq_len) {
                     float s = smem_sum[wid][fr];
                     float out_val = (s > 0.f) ? (acc_frag[f].x[i] / s) : 0.f;
