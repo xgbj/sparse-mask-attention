@@ -311,6 +311,7 @@ GPU: NVIDIA GeForce RTX 3080 (sm_86)
 | 18 | BN 16→64（大 tile）| 0.938 ms | 13.72 | 2.53x | 0.91x |
 | 19 | smem Q/K/V pad+8 | 0.622 ms | 20.73 | 3.67x | 1.38x ★ |
 | 20 | mask预读smem | 0.595 ms | 21.64 | 3.84x | 1.38x |
+| 21 | 2-lane并行softmax | 0.583 ms | 22.12 | 3.92x | 1.41x |
 
 Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - **PyTorch Ref (FP16 TC):** 2.090 ms, 6.16 TFLOPS
@@ -319,8 +320,8 @@ Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - **FlashInfer:** 1.061 ms, 12.14 TFLOPS ← 已超越
 - **flash-attn (dense, 无mask):** 0.368 ms, 35.04 TFLOPS ← 当前目标
 
-总提速: 16.571ms → 0.595ms = **27.9x** (Baseline → Round 20)
-当前状态: 已超越 Triton 1.38x，距 flash-attn (dense) 还差 1.61x
+总提速: 16.571ms → 0.583ms = **28.4x** (Baseline → Round 21)
+当前状态: 已超越 Triton 1.41x，距 flash-attn (dense) 还差 1.58x
 
 ### Round 13 — WMMA PV 累加（失败，已回滚）
 
@@ -509,3 +510,36 @@ ncu 对比 R19→R20:
 - 加速比 vs Ref: 3.84x；vs Triton: 1.38x
 
 关键指标 (N=512): **0.595 ms, 21.64 TFLOPS** (vs Round 19: 0.622ms, 提速 1.05x)
+
+### Round 21 — 2-lane 并行 softmax（每行 2 lanes 协作）
+
+改动: csrc/sparse_attention.cu
+- softmax 从 16 lanes（每 lane 处理 64 个 score）改为 32 lanes（每 lane 处理 32 个 score）
+- lane 映射: row = lane % 16, half = lane / 16（half=0 处理 score[0..31], half=1 处理 score[32..63]）
+- 用 `__shfl_xor_sync(mask, val, BM=16)` 在两个 half 之间合并 max 和 sum
+- 每 lane 的寄存器数组从 float[64] 减半到 float[32]，降低寄存器压力
+- half=0 负责写 smem_max/smem_sum/smem_rsc，避免 race condition
+
+原因: R20 profile 显示 FMUL 121M + FADD 63.6M，math_pipe_throttle 1.15。
+softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
+2-lane 并行将每 lane 的 expf 调用从 64 次减半到 32 次。
+
+序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
+| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+|---|---|---|---|
+| 64 | 0.033 | 6.05 | 20.3% |
+| 128 | 0.065 | 12.40 | 41.6% |
+| 256 | 0.177 | 18.23 | 61.2% |
+| 512 | 0.583 | 22.12 | 74.2% |
+| 1024 | 2.008 | 25.67 | 86.1% |
+
+横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
+- Ours: 0.533 ms (24.18 TFLOPS)
+- Triton: 0.752 ms (17.13 TFLOPS)
+- cuDNN SDPA: 0.892 ms (14.44 TFLOPS)
+- FlashInfer: 1.043 ms (12.36 TFLOPS)
+- PyTorch Ref: 2.089 ms (6.16 TFLOPS)
+- flash-attn (dense): 0.403 ms (31.98 TFLOPS)
+- 加速比 vs Ref: 3.92x；vs Triton: 1.41x
+
+关键指标 (N=512): **0.583 ms, 22.12 TFLOPS** (vs Round 20: 0.595ms, 提速 1.02x)
