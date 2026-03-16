@@ -9,44 +9,50 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-Compiles `csrc/sparse_attention.cu` into the `sparse_attn_cuda` Python extension. Targets A100 (`sm_80`) with `-O3 --use_fast_math`.
+Compiles `csrc/sparse_attention.cu` into the `sparse_attn_cuda` Python extension. Auto-detects GPU arch via `run.py`.
 
 ## Tests
 
-```bash
-python tests/test_correctness.py   # correctness vs PyTorch reference
-python tests/test_performance.py   # latency/MFU scaling
-```
+All testing is done via the unified `run.py` entry point:
 
-Benchmarks (require `flash-attn`):
 ```bash
-python benchmarks/profile_mfu.py
-python benchmarks/compare_flash.py --seq_len 512
-python benchmarks/compare_flashinfer.py --seq_len 512
+python run.py --mode correctness   # correctness vs FP32 PyTorch reference
+python run.py --mode perf           # latency/MFU scaling + baseline comparison
+python run.py --mode compare        # full横向对比 ours/triton/cudnn/flashinfer/flash-attn
+python run.py                       # runs correctness + perf (default --mode all)
 ```
 
 ## Architecture
 
-CUDA kernel for sparse masked attention optimized for short sequences (<1K tokens) with high sparsity (~75%) on A100.
+CUDA kernel for sparse masked attention optimized for short sequences (<1K tokens) with high sparsity (~75%). Tested on RTX 3080 (sm_86).
 
-**Key optimization:** Bit-packs the bool mask `[B,H,N,N]` → uint32 `[B,H,N,N/32]` (8x memory savings), then skips fully-masked K/V blocks in the kernel using `__ballot_sync()` warp voting.
+**Key optimizations:**
+- Bit-packs bool mask `[B,H,N,N]` → uint32 `[B,H,N,N/32]` (8x memory savings)
+- WMMA m16n16k16 Tensor Core for both QK^T and PV accumulation
+- Register-resident online softmax with `__shfl_xor_sync` cross-lane reduction (no smem round-trip)
+- smem padding (+8 halves) to eliminate bank conflicts
+- cp.async for K/V loading, mask preloaded to smem
 
-**Kernel parameters:** `BLOCK_M=32, BLOCK_N=32`, head dim fixed at 64, FP32 accumulation for online softmax, BF16/FP16 I/O.
+**Kernel parameters:** BM=16, BN=64, HD=64, 4 warps/block (128 threads), FP16 I/O with FP32 accumulation.
 
 ### File roles
 
-- `csrc/sparse_attention.cu` — forward kernel (`sparse_attention_fwd_kernel`), mask packing kernel, BF16/FP16 host launchers
+- `csrc/sparse_attention.cu` — WMMA FP16 kernel (`sparse_attn_wmma_full_fp16`), scalar BF16 fallback, mask packing kernel, host launchers
 - `csrc/sparse_attention.h` — `SparseAttentionParams` struct, function declarations
-- `csrc/utils.cuh` — warp reductions, bit-mask read helpers (`read_mask_bit`, `is_block_all_masked`), type conversions
-- `python/sparse_attention.py` — PyTorch autograd `Function` wrapper, `sparse_attention()` user API, `sparse_attention_ref()` reference impl, `pack_mask()`
-- `python/benchmark.py` — MFU measurement utilities, A100 peak TFLOPS lookup
+- `csrc/binding.cpp` — pybind11 bindings
+- `csrc/utils.cuh` — warp reductions, bit-mask helpers, type conversions
+- `python/sparse_attention.py` — PyTorch autograd `Function` wrapper, `sparse_attention()` user API, `sparse_attention_ref()` reference impl
+- `run.py` — unified test/benchmark entry (JIT compiles, includes correctness/perf/compare modes, Triton baseline)
+- `notes/perf_log.md` — detailed per-round optimization log
+- `notes/optimization_rules.md` — optimization methodology rules
+- `notes/gen_chart.py` — generates performance chart
 
 ### Data flow
 
 ```
 Q, K, V [B,H,N,D] + bool mask [B,H,N,N]
   → pack_mask_kernel → uint32 mask [B,H,N,N/32]
-  → sparse_attention_fwd_kernel (skips all-masked blocks)
+  → sparse_attn_wmma_full_fp16 (register softmax, skips all-masked tiles)
   → output [B,H,N,D]
 ```
 

@@ -23,6 +23,7 @@ venv/
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 
 # 测试缓存

@@ -6,7 +6,7 @@
 
 **目标：** 编写一个能够跳过全掩码 K/V 块的稀疏注意力 CUDA kernel，在 RTX 3080 上超越 Triton 实现，并与 FlashAttention、cuDNN SDPA、FlashInfer 等主流实现进行对比。
 
-**最终成果：** 从基线 16.571ms 优化至 0.571ms，**总提速 29x**，比 Triton 快 **1.44x**。
+**最终成果：** 从基线 16.571ms 优化至 0.512ms，**总提速 32x**，比 Triton 快 **1.59x**。
 
 ---
 
@@ -110,7 +110,8 @@ WMMA fragment layout 在 sm_86 上的列偏移为 `col_off={0,1,0,1,8,9,8,9}`，
 
 - **R16（NWARPS 4→8）：** smem 从 20KB 增至 32KB，每 SM 可容纳的 block 数从 2 降至 1，occupancy 下降，延迟反升至 1.129ms
 - **R17（cp.async 真双缓冲）：** 双缓冲需要额外的 `__syncthreads()` 同步，开销抵消了预取收益，延迟 1.064ms（持平）
-- **R23 系列（向量化输出、合并输出、K/V 双缓冲）：** 均持平或轻微退步，当前瓶颈已转移至 TC pipeline wait stall
+- **K/V 双缓冲（smem 37→57KB）：** occupancy 从 2→1 blocks/SM，严重退化
+- **去除 sparse skip：** 75% random sparsity + BN=64 下全零 tile 极少，几乎无效
 
 ---
 
@@ -144,12 +145,12 @@ BN（K/V tile 大小）越小，稀疏跳过越精细，但循环开销越大；
 
 | 实现 | 延迟 | TFLOPS | 相对本项目 |
 |------|------|--------|-----------|
-| **本项目（R22）** | **0.571ms** | **22.58** | **1.00x（基准）** |
-| Triton | 0.747ms | 17.26 | 0.76x（本项目快 1.44x） |
-| cuDNN SDPA | 0.891ms | 14.47 | 0.64x（本项目快 1.56x） |
-| FlashInfer | 1.040ms | 12.39 | 0.55x（本项目快 1.82x） |
-| PyTorch 参考实现 | 2.090ms | 6.17 | 0.27x（本项目快 4.02x） |
-| flash-attn（dense，无 mask） | 0.402ms | 32.07 | 1.42x（dense 上界） |
+| **本项目（R23）** | **0.512ms** | **25.17** | **1.00x（基准）** |
+| Triton | 0.751ms | 17.15 | 0.66x（本项目快 1.59x） |
+| cuDNN SDPA | 0.892ms | 14.45 | 0.57x（本项目快 1.74x） |
+| FlashInfer | 1.082ms | 11.91 | 0.47x（本项目快 2.11x） |
+| PyTorch 参考实现 | 2.091ms | 6.16 | 0.24x（本项目快 4.42x） |
+| flash-attn（dense，无 mask） | 0.403ms | 31.96 | 1.27x（dense 上界） |
 
 > 注：flash-attn 为 dense 实现，不处理稀疏掩码，为理论上界参考。
 
@@ -159,8 +160,8 @@ BN（K/V tile 大小）越小，稀疏跳过越精细，但循环开销越大；
 |------|------|------|---------|
 | 第一阶段（标量优化） | 16.571ms | 3.247ms | 5.1x |
 | 第二阶段（WMMA QK^T） | 3.673ms（FP16 重置） | 1.763ms | 2.1x |
-| 第三阶段（WMMA 全覆盖 + 访存优化） | 1.046ms | 0.571ms | 1.83x |
-| **总计** | **16.571ms** | **0.571ms** | **29x** |
+| 第三阶段（WMMA 全覆盖 + 访存优化） | 1.046ms | 0.512ms | 2.04x |
+| **总计** | **16.571ms** | **0.512ms** | **32x** |
 
 ---
 
@@ -189,6 +190,6 @@ BN（K/V tile 大小）越小，稀疏跳过越精细，但循环开销越大；
 
 ## 总结
 
-本项目通过 22 轮系统性优化，将稀疏掩码注意力 kernel 从 16.571ms 优化至 0.571ms（**29x 总提速**），在 RTX 3080 上达到 22.58 TFLOPS，比 Triton 快 **1.44x**，比 cuDNN SDPA 快 **1.56x**，比 FlashInfer 快 **1.82x**。
+本项目通过 23 轮系统性优化，将稀疏掩码注意力 kernel 从 16.571ms 优化至 0.512ms（**32x 总提速**），在 RTX 3080 上达到 25.17 TFLOPS（84.4% MFU），比 Triton 快 **1.59x**，比 cuDNN SDPA 快 **1.74x**，比 FlashInfer 快 **2.11x**。
 
-核心优化路径：消除寄存器溢出 → 多 warp 提升 occupancy → WMMA Tensor Core 加速 → smem padding 消除 bank conflict → 访存与计算细节优化。每一步都有明确的性能模型支撑，失败尝试也提供了宝贵的反向验证。
+核心优化路径：消除寄存器溢出 → 多 warp 提升 occupancy → WMMA Tensor Core 加速 → smem padding 消除 bank conflict → 寄存器内 softmax 消除 smem round-trip。每一步都有明确的性能模型支撑，失败尝试也提供了宝贵的反向验证。
