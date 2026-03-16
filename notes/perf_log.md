@@ -613,3 +613,19 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 - 加速比 vs Ref: 4.42x；vs Triton: 1.59x
 
 关键指标 (N=512): **0.512 ms, 25.17 TFLOPS** (vs Round 22: 0.571ms, 提速 1.12x)
+
+### Round 24 — 多轮尝试均无有效进展（已回滚）
+
+尝试 1: expf → __expf
+- 原因: 期望 __expf 减少 math pipe 压力
+- 结果: 持平 (0.512 ms)，--use_fast_math 下 expf 已映射快速路径
+
+尝试 2: ballot 提前，K/V 加载移到 skip 之后
+- 原因: 被 skip 的 tile 可避免 K/V 加载，75% sparsity 下约 6/8 tile 可省
+- 结果: 退化 (0.536 ms)。原因：原来 K/V cp.async 与 mask 预加载重叠；调整后不 skip 的 tile 串行化，损失大于节省
+
+尝试 3: __launch_bounds__(128, 2)
+- 原因: 暗示编译器优化 occupancy
+- 结果: 持平，当前已约 2 blocks/SM，无实质影响
+
+结论: 当前 kernel 在现有架构下已接近局部最优，需更大改动（如 PTX MMA、不同 tile 策略）才有突破
