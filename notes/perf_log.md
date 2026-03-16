@@ -312,17 +312,16 @@ GPU: NVIDIA GeForce RTX 3080 (sm_86)
 | 19 | smem Q/K/V pad+8 | 0.622 ms | 20.73 | 3.67x | 1.38x ★ |
 | 20 | mask预读smem | 0.595 ms | 21.64 | 3.84x | 1.38x |
 | 21 | 2-lane并行softmax | 0.583 ms | 22.12 | 3.92x | 1.41x |
-| 22 | smem_k/smem_p union | 0.584 ms | 22.07 | 3.92x | 1.40x |
 
 Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - **PyTorch Ref (FP16 TC):** 2.090 ms, 6.16 TFLOPS
-- **Triton (FP16 TC):** 0.746 ms, 17.28 TFLOPS ← 已超越
-- **cuDNN SDPA:** 0.890 ms, 14.48 TFLOPS ← 已超越
-- **FlashInfer:** 1.047 ms, 12.30 TFLOPS ← 已超越
-- **flash-attn (dense, 无mask):** 0.402 ms, 32.03 TFLOPS ← 当前目标
+- **Triton (FP16 TC):** 0.792 ms, 16.27 TFLOPS ← 已超越
+- **cuDNN SDPA:** 0.904 ms, 14.25 TFLOPS ← 已超越
+- **FlashInfer:** 1.061 ms, 12.14 TFLOPS ← 已超越
+- **flash-attn (dense, 无mask):** 0.368 ms, 35.04 TFLOPS ← 当前目标
 
-总提速: 16.571ms → 0.584ms = **28.4x** (Baseline → Round 22)
-当前状态: 已超越 Triton 1.40x，N=1024 MFU 89.9%，距 flash-attn (dense) 还差 1.45x
+总提速: 16.571ms → 0.583ms = **28.4x** (Baseline → Round 21)
+当前状态: 已超越 Triton 1.41x，距 flash-attn (dense) 还差 1.58x
 
 ### Round 13 — WMMA PV 累加（失败，已回滚）
 
@@ -544,26 +543,3 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 - 加速比 vs Ref: 3.92x；vs Triton: 1.41x
 
 关键指标 (N=512): **0.583 ms, 22.12 TFLOPS** (vs Round 20: 0.595ms, 提速 1.02x)
-
-### Round 22 — smem_k 和 smem_p 共享内存 (union)
-
-改动: csrc/sparse_attention.cu
-- smem_k[BN][HD+PP] 和 smem_p[NWARPS][BM][BN+PP] 共享同一块 smem（都是 9216B）
-- 用 `reinterpret_cast` 创建两个指针 alias 指向同一块 `smem_kp[4608]`
-- smem_k 只在 QK^T WMMA 中使用，smem_p 只在 softmax+PV WMMA 中使用，生命周期不重叠
-- 总 smem 从 ~37KB 降到 ~28KB
-
-原因: 减少 smem 用量提高 occupancy。28KB/block → 每 SM 可放 3 blocks（vs 2 before）。
-效果: N=512 持平（0.584 vs 0.583ms），但 N=1024 提速 4.4%（1.923 vs 2.008ms）。
-大 N 时 block 数更多，occupancy 提升更明显。N=1024 MFU 达到 89.9%。
-
-序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
-| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
-|---|---|---|---|
-| 64 | 0.033 | 6.03 | 20.3% |
-| 128 | 0.064 | 12.57 | 42.2% |
-| 256 | 0.177 | 18.18 | 61.0% |
-| 512 | 0.584 | 22.07 | 74.1% |
-| 1024 | 1.923 | 26.80 | 89.9% |
-
-关键指标 (N=512): **0.584 ms, 22.07 TFLOPS** (vs Round 21: 0.583ms, 持平；N=1024 提速 4.4%)

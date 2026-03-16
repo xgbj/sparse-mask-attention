@@ -108,19 +108,15 @@ __global__ void sparse_attn_wmma_full_fp16(
     const int nw  = (seq_len + 31) / 32;
     const uint32_t* Mbh = mask_packed + (batch_id * num_heads + head_id) * seq_len * nw;
 
-    // ---- Shared memory (Round 22: union smem_k and smem_p to save 9KB) ----
-    // smem_k used only during QK^T WMMA, smem_p used only during softmax+PV WMMA.
-    // Both are 9216B (64×72×2 = 4×16×72×2). Union saves 9KB → total ~28KB.
-    // 28KB/block → 3 blocks/SM (vs 2 before), occupancy +50%.
+    // ---- Shared memory (Round 19: pad K/V inner dim to eliminate bank conflicts) ----
+    // PP=8: pad smem_p/q/k/v columns so stride = 72 halves (144 bytes).
+    //   144 / 4 = 36 bank slots per row, 36 % 32 = 4 → consecutive rows shift 4 banks.
+    //   Reduces 16-way bank conflicts to 2-way for WMMA loads.
     constexpr int PP = 8;  // column padding for all smem arrays
-    constexpr int KP_SIZE = BN * (HD + PP);  // = 64*72 = 4608 halves = 9216 bytes
     __shared__ __align__(16) __half smem_q[NWARPS][BM][HD + PP];     // Q tiles (padded)
-    __shared__ __align__(16) __half smem_kp[KP_SIZE];                // shared by K and P
+    __shared__ __align__(16) __half smem_k[BN][HD + PP];             // K single-buffer (padded)
     __shared__ __align__(16) __half smem_v[BN][HD + PP];             // V single-buffer (padded)
-    // Aliases: smem_k[BN][HD+PP] and smem_p[NWARPS][BM][BN+PP] overlay smem_kp
-    // Both have 4608 halves: BN*(HD+PP) = 64*72 = 4608, NWARPS*BM*(BN+PP) = 4*16*72 = 4608 ✓
-    __half (*smem_k)[HD + PP] = reinterpret_cast<__half(*)[HD + PP]>(smem_kp);
-    __half (*smem_p)[BM][BN + PP] = reinterpret_cast<__half(*)[BM][BN + PP]>(smem_kp);
+    __shared__ __align__(16) __half smem_p[NWARPS][BM][BN + PP];    // scores P (padded)
     __shared__ float     smem_max[NWARPS][BM];
     __shared__ float     smem_sum[NWARPS][BM];
     __shared__ float     smem_rsc[NWARPS][BM];
