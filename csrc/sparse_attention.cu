@@ -121,6 +121,7 @@ __global__ void sparse_attn_wmma_full_fp16(
     __shared__ float     smem_sum[NWARPS][BM];
     __shared__ float     smem_rsc[NWARPS][BM];
     __shared__ uint32_t  warp_ballots[NWARPS];
+    __shared__ uint32_t  smem_mask[BROWS][2];  // mask bits for current tile: [row][word0/word1]
 
     // ---- Initialize Q tile and rowstate ----
     for (int i = tid; i < NWARPS * BM * HD; i += NTH) {
@@ -196,34 +197,44 @@ __global__ void sparse_attn_wmma_full_fp16(
         // Load K and V tile (4 rows per thread)
         LOAD_KV_SYNC(tn);
 
-        // ---- Sparse block skip check: BN=64 spans up to 3 uint32 words ----
-        // We check 64 bits: mask[grow][cs..cs+63]
-        uint32_t mword = 0u;
-        if (vr) {
-            int wi = cs / 32, bo = cs % 32;
-            mword = Mbh[grow * nw + wi] >> bo;
-            if (bo > 0 && (wi + 1) < nw)
-                mword |= Mbh[grow * nw + wi + 1] << (32 - bo);
-            // For BN=64, also check the upper 32 bits
-            uint32_t mword2 = 0u;
-            int wi2 = (cs + 32) / 32, bo2 = (cs + 32) % 32;
-            if (cs + 32 < seq_len) {
-                mword2 = Mbh[grow * nw + wi2] >> bo2;
-                if (bo2 > 0 && (wi2 + 1) < nw)
-                    mword2 |= Mbh[grow * nw + wi2 + 1] << (32 - bo2);
-                int vc2 = min(32, seq_len - (cs + 32));
-                if (vc2 < 32) mword2 &= (1u << vc2) - 1u;
+        // ---- Preload mask to smem + sparse block skip check ----
+        // 128 threads cooperatively load BROWS=64 rows × 2 uint32 words = 128 words.
+        // Each thread loads 1 word (128 threads / 128 words = 1 word/thread).
+        {
+            const int mi = tid;  // tid in [0, 128), load word mi
+            const int mrow = mi / 2;   // row index in [0, 64)
+            const int mwi  = mi % 2;   // word index: 0=low 32 bits, 1=high 32 bits
+            const int gr_m = blk_row + mrow;
+            uint32_t mval = 0u;
+            if (gr_m < seq_len) {
+                const int col_base = cs + mwi * 32;
+                if (col_base < seq_len) {
+                    int wi = col_base / 32, bo = col_base % 32;
+                    mval = Mbh[gr_m * nw + wi] >> bo;
+                    if (bo > 0 && (wi + 1) < nw)
+                        mval |= Mbh[gr_m * nw + wi + 1] << (32 - bo);
+                    int vc = min(32, seq_len - col_base);
+                    if (vc < 32) mval &= (1u << vc) - 1u;
+                }
             }
-            int vc = min(32, seq_len - cs);
-            if (vc < 32) mword &= (1u << vc) - 1u;
-            mword |= mword2;  // any bit set in either 32-bit half
+            smem_mask[mrow][mwi] = mval;
         }
-        uint32_t ballot = __ballot_sync(0xffffffff, mword != 0u);
-        if (lane == 0) warp_ballots[wid] = ballot;
 
-        // Wait for K/V tile load to complete
+        // Sparse skip: check if any row in this warp has any unmasked bit
+        // Use smem_mask that was just written (need syncthreads after K/V load anyway)
         cp_async_wait<0>();
         __syncthreads();
+
+        // Ballot from smem_mask: each warp checks its BM=16 rows
+        {
+            uint32_t any_bits = 0u;
+            if (lane < BM && wr + lane < seq_len) {
+                any_bits = smem_mask[wid * BM + lane][0] | smem_mask[wid * BM + lane][1];
+            }
+            uint32_t ballot = __ballot_sync(0xffffffff, any_bits != 0u);
+            if (lane == 0) warp_ballots[wid] = ballot;
+        }
+        __syncwarp();
 
         if ((warp_ballots[0] | warp_ballots[1] | warp_ballots[2] | warp_ballots[3]) == 0u) continue;
 
@@ -247,7 +258,7 @@ __global__ void sparse_attn_wmma_full_fp16(
                 }
             }
 
-            // Write scores to smem_p with mask applied
+            // Write scores to smem_p with mask applied (read mask from smem_mask)
             // qk_sub[f] covers output cols [f*WK .. (f+1)*WK-1]
 #pragma unroll
             for (int f = 0; f < NQK; f++) {
@@ -256,9 +267,9 @@ __global__ void sparse_attn_wmma_full_fp16(
                     int fr  = lane / 4 + ((i & 2) ? 8 : 0);
                     int fc  = f * WK + (lane % 4) * 2 + wmma_col_off[i];
                     int gr2 = wr + fr;
-                    int gc2 = cs + fc;
-                    bool ok = (gr2 < seq_len) && (gc2 < seq_len) &&
-                              ((Mbh[gr2 * nw + gc2 / 32] >> (gc2 % 32)) & 1u);
+                    // Read mask from smem: fc in [0,64), word index = fc/32, bit = fc%32
+                    bool ok = (gr2 < seq_len) && (cs + fc < seq_len) &&
+                              ((smem_mask[wid * BM + fr][fc / 32] >> (fc % 32)) & 1u);
                     float sv = ok ? (qk_sub[f].x[i] * scale) : -65504.f;
                     smem_p[wid][fr][fc] = __float2half(sv);
                 }

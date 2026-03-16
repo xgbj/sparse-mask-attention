@@ -310,6 +310,7 @@ GPU: NVIDIA GeForce RTX 3080 (sm_86)
 | 17 | cp.async 真双缓冲（持平） | 1.064 ms | 12.12 | 2.24x | 0.80x |
 | 18 | BN 16→64（大 tile）| 0.938 ms | 13.72 | 2.53x | 0.91x |
 | 19 | smem Q/K/V pad+8 | 0.622 ms | 20.73 | 3.67x | 1.38x ★ |
+| 20 | mask预读smem | 0.595 ms | 21.64 | 3.84x | 1.38x |
 
 Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - **PyTorch Ref (FP16 TC):** 2.090 ms, 6.16 TFLOPS
@@ -318,8 +319,8 @@ Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - **FlashInfer:** 1.061 ms, 12.14 TFLOPS ← 已超越
 - **flash-attn (dense, 无mask):** 0.368 ms, 35.04 TFLOPS ← 当前目标
 
-总提速: 16.571ms → 0.622ms = **26.6x** (Baseline → Round 19)
-当前状态: 已超越 Triton 1.38x，距 flash-attn (dense) 还差 1.69x
+总提速: 16.571ms → 0.595ms = **27.9x** (Baseline → Round 20)
+当前状态: 已超越 Triton 1.38x，距 flash-attn (dense) 还差 1.61x
 
 ### Round 13 — WMMA PV 累加（失败，已回滚）
 
@@ -469,3 +470,42 @@ smem 增量: Q +4×16×8×2=1024B, K +64×8×2=1024B, V +64×8×2=1024B, 总 +3K
 - 加速比 vs Ref: 3.67x；vs Triton: 1.38x ★ 首次超越 Triton
 
 关键指标 (N=512): **0.622 ms, 20.73 TFLOPS** (vs Round 18: 0.938ms, 提速 1.51x)
+
+### Round 20 — mask 预读到 smem，消除逐元素全局内存读取
+
+改动: csrc/sparse_attention.cu
+- 新增 `smem_mask[BROWS][2]` (64 rows × 2 uint32 = 512 bytes)
+- 128 线程协作预读当前 tile 的 mask 到 smem（每线程 1 word）
+- sparse skip check 改为从 smem_mask 读取（替代原来每 warp 独立读 global）
+- QK^T score 写入时的 mask 判断从 `Mbh[gr2*nw + gc2/32]` 改为 `smem_mask[wid*BM+fr][fc/32]`
+- 消除了 score 写入时 32 lanes × 8 elements × 4 warps = 1024 次/tile 的全局内存读取
+
+原因: ncu profile 显示 1.03B 整数指令（占 43%）和 21.6M global load sectors。
+mask 逐元素读取产生大量地址计算（乘法、除法、移位）和全局内存访问。
+预读到 smem 后，score 写入只需简单的 smem 读取 + 位移位。
+
+ncu 对比 R19→R20:
+- 整数指令: 1,027M → 627M (-39%)
+- 全局 load sectors: 21.6M → 8.3M (-62%)
+- 总指令: 85.6M → 73.6M (-14%)
+- TC utilization: 22.5% → 23.8% (+5%)
+
+序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
+| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+|---|---|---|---|
+| 64 | 0.034 | 5.96 | 20.0% |
+| 128 | 0.065 | 12.35 | 41.5% |
+| 256 | 0.180 | 17.86 | 59.9% |
+| 512 | 0.595 | 21.64 | 72.6% |
+| 1024 | 2.174 | 23.70 | 79.5% |
+
+横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
+- Ours: 0.544 ms (23.69 TFLOPS)
+- Triton: 0.752 ms (17.14 TFLOPS)
+- cuDNN SDPA: 0.892 ms (14.44 TFLOPS)
+- FlashInfer: 1.041 ms (12.38 TFLOPS)
+- PyTorch Ref: 2.091 ms (6.16 TFLOPS)
+- flash-attn (dense): 0.403 ms (31.96 TFLOPS)
+- 加速比 vs Ref: 3.84x；vs Triton: 1.38x
+
+关键指标 (N=512): **0.595 ms, 21.64 TFLOPS** (vs Round 19: 0.622ms, 提速 1.05x)
