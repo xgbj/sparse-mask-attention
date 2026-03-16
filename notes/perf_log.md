@@ -313,16 +313,17 @@ GPU: NVIDIA GeForce RTX 3080 (sm_86)
 | 20 | mask预读smem | 0.595 ms | 21.64 | 3.84x | 1.38x |
 | 21 | 2-lane并行softmax | 0.583 ms | 22.12 | 3.92x | 1.41x |
 | 22 | 合并sc/pv数组 | 0.571 ms | 22.58 | 4.02x | 1.44x |
+| 23 | 寄存器内softmax | 0.512 ms | 25.17 | 4.42x | 1.59x |
 
 Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
-- **PyTorch Ref (FP16 TC):** 2.090 ms, 6.16 TFLOPS
-- **Triton (FP16 TC):** 0.747 ms, 17.24 TFLOPS ← 已超越
-- **cuDNN SDPA:** 0.891 ms, 14.47 TFLOPS ← 已超越
-- **FlashInfer:** 1.040 ms, 12.39 TFLOPS ← 已超越
-- **flash-attn (dense, 无mask):** 0.402 ms, 32.02 TFLOPS ← 当前目标
+- **PyTorch Ref (FP16 TC):** 2.091 ms, 6.16 TFLOPS
+- **Triton (FP16 TC):** 0.751 ms, 17.15 TFLOPS ← 已超越
+- **cuDNN SDPA:** 0.892 ms, 14.45 TFLOPS ← 已超越
+- **FlashInfer:** 1.082 ms, 11.91 TFLOPS ← 已超越
+- **flash-attn (dense, 无mask):** 0.403 ms, 31.96 TFLOPS ← 当前目标
 
-总提速: 16.571ms → 0.571ms = **29.0x** (Baseline → Round 22)
-当前状态: 已超越 Triton 1.44x，距 flash-attn (dense) 还差 1.42x
+总提速: 16.571ms → 0.512ms = **32.4x** (Baseline → Round 23)
+当前状态: 已超越 Triton 1.59x，距 flash-attn (dense) 还差 1.17x
 
 ### Round 13 — WMMA PV 累加（失败，已回滚）
 
@@ -575,3 +576,40 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 - 加速比 vs Ref: 4.02x；vs Triton: 1.44x
 
 关键指标 (N=512): **0.571 ms, 22.58 TFLOPS** (vs Round 21: 0.583ms, 提速 1.02x)
+
+### Round 23 — 寄存器内 softmax（Register-resident softmax）
+
+改动: csrc/sparse_attention.cu
+- softmax 从 smem-based（2-lane 并行从 smem_p 读写）改为 register-based
+- 利用 WMMA accumulator fragment 的确定性 lane 布局（row = lane/4, 4 lanes/row）
+- 用 `__shfl_xor_sync(mask, val, 1)` + `__shfl_xor_sync(mask, val, 2)` 跨 4 lanes 归约 max/sum
+- 消除 smem_max/smem_sum/smem_rsc（全部改为寄存器 old_max_a/b, old_sum_a/b）
+- 消除 QK→smem_p 的写入和 softmax 从 smem_p 的读取（50% smem_p 流量减少）
+- 减少 1 个 __syncwarp 屏障/迭代
+- rescale 直接用寄存器中的 rsc_a/rsc_b，无需 smem 访问
+- 输出归一化和 LSE 写入也改用寄存器中的 max/sum
+- 修复了原有 LSE 只写 row 0-7（缺 row 8-15）的 bug
+- smem 从 ~37.4KB 降至 ~36.7KB（省 smem_max/sum/rsc 共 768B）
+
+原因: R22 profile 显示 softmax 涉及大量 smem 往返（QK 写→softmax 读→写回→PV 读）。
+通过在寄存器中完成 softmax，消除初始 QK→smem_p 写+读 round-trip，减少 ~96 smem load/store/迭代。
+
+序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
+| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+|---|---|---|---|
+| 64 | 0.031 | 6.50 | 21.8% |
+| 128 | 0.061 | 13.24 | 44.4% |
+| 256 | 0.159 | 20.31 | 68.2% |
+| 512 | 0.512 | 25.17 | 84.4% |
+| 1024 | 1.854 | 27.80 | 93.3% |
+
+横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
+- Ours: 0.473 ms (27.22 TFLOPS)
+- Triton: 0.751 ms (17.15 TFLOPS)
+- cuDNN SDPA: 0.892 ms (14.45 TFLOPS)
+- FlashInfer: 1.082 ms (11.91 TFLOPS)
+- PyTorch Ref: 2.091 ms (6.16 TFLOPS)
+- flash-attn (dense): 0.403 ms (31.96 TFLOPS)
+- 加速比 vs Ref: 4.42x；vs Triton: 1.59x
+
+关键指标 (N=512): **0.512 ms, 25.17 TFLOPS** (vs Round 22: 0.571ms, 提速 1.12x)

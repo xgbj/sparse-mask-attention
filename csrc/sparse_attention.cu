@@ -1,29 +1,30 @@
 /*
  * Sparse Mask Attention - CUDA Kernel
  *
- * Round 19: Pad smem_q/k/v inner dim by 8 to eliminate bank conflicts
- *   (builds on Round 18: BN=64 large tile)
+ * Round 23: Register-resident softmax — eliminate smem_max/sum/rsc,
+ *   do softmax entirely in registers using WMMA fragment layout.
+ *   (builds on Round 22: merged sc/pv arrays)
  *
- * Key change: smem_q/k/v stride 64→72 halves (144 bytes/row).
- *   144/4 = 36 bank slots, 36%32 = 4 → consecutive rows shift 4 banks.
- *   Reduces 16-way bank conflicts to 2-way for all WMMA loads.
- *   Profile showed 50M smem load conflicts; ~84% from K/V, ~10% from Q.
+ * Key change: Exploit WMMA accumulator layout (row = lane/4, 4 lanes/row)
+ *   to do softmax via __shfl_xor_sync(mask, val, 1/2) cross-lane reduction.
+ *   - Eliminates QK→smem_p write + softmax smem_p read (50% less smem_p traffic)
+ *   - Eliminates smem_max/smem_sum/smem_rsc (all register-resident)
+ *   - Removes 1 __syncwarp barrier per iteration
+ *   - Per-iteration savings: ~96 smem load/store + 1 barrier
  *
- * Key WMMA accumulator element layout (m16n16k16, float, row_major):
+ * WMMA accumulator element layout (m16n16k16, float, row_major):
  *   frag.x[i], lane L:
  *     row = L/4 + ((i & 2) ? 8 : 0)
  *     col offsets: {0,1,0,1,8,9,8,9}[i] + (L%4)*2
  *
  * Shared memory per block:
- *   smem_q[4][16][64]    fp16  =  8192 B
- *   smem_k[2][64][64]    fp16  = 16384 B  (double buffer, BN=64)
- *   smem_v[2][64][64]    fp16  = 16384 B  (double buffer, BN=64)
- *   smem_p[4][16][72]    fp16  =  9216 B  (BN+8=72 halves padding)
- *   smem_max[4][16]      float =   256 B
- *   smem_sum[4][16]      float =   256 B
- *   smem_rsc[4][16]      float =   256 B
+ *   smem_q[4][16][72]    fp16  =  9216 B  (HD+8 padding)
+ *   smem_k[64][72]       fp16  =  9216 B  (HD+8 padding)
+ *   smem_v[64][72]       fp16  =  9216 B  (HD+8 padding)
+ *   smem_p[4][16][72]    fp16  =  9216 B  (BN+8 padding)
+ *   smem_mask[64][2]     u32   =   512 B
  *   warp_ballots[4]      u32   =    16 B
- *   Total ≈ 51.0 KB  ← fits in RTX 3080 (100 KB per SM)
+ *   Total ≈ 36.7 KB
  */
 
 #include "sparse_attention.h"
@@ -117,13 +118,10 @@ __global__ void sparse_attn_wmma_full_fp16(
     __shared__ __align__(16) __half smem_k[BN][HD + PP];             // K single-buffer (padded)
     __shared__ __align__(16) __half smem_v[BN][HD + PP];             // V single-buffer (padded)
     __shared__ __align__(16) __half smem_p[NWARPS][BM][BN + PP];    // scores P (padded)
-    __shared__ float     smem_max[NWARPS][BM];
-    __shared__ float     smem_sum[NWARPS][BM];
-    __shared__ float     smem_rsc[NWARPS][BM];
     __shared__ uint32_t  warp_ballots[NWARPS];
     __shared__ uint32_t  smem_mask[BROWS][2];  // mask bits for current tile: [row][word0/word1]
 
-    // ---- Initialize Q tile and rowstate ----
+    // ---- Initialize Q tile and register-resident row state ----
     for (int i = tid; i < NWARPS * BM * HD; i += NTH) {
         int w = i / (BM * HD);
         int r = (i % (BM * HD)) / HD;
@@ -131,11 +129,10 @@ __global__ void sparse_attn_wmma_full_fp16(
         int gr = blk_row + w * BM + r;
         smem_q[w][r][d] = (gr < seq_len) ? Qbh[gr * HD + d] : __float2half(0.f);
     }
-    if (lane < BM) {
-        smem_max[wid][lane] = -65504.f;
-        smem_sum[wid][lane] = 0.f;
-        smem_rsc[wid][lane] = 1.f;
-    }
+
+    // Running max/sum in registers: each lane tracks 2 rows (row_a=lane/4, row_b=lane/4+8)
+    float old_max_a = -65504.f, old_max_b = -65504.f;
+    float old_sum_a = 0.f, old_sum_b = 0.f;
 
     // ---- Per-warp accumulator fragments ----
     // NF=4 fragments, each m16n16k16, covering output cols [f*16..(f+1)*16-1]
@@ -238,9 +235,10 @@ __global__ void sparse_attn_wmma_full_fp16(
 
         if ((warp_ballots[0] | warp_ballots[1] | warp_ballots[2] | warp_ballots[3]) == 0u) continue;
 
-        // ---- WMMA QK^T: Q[BM×HD] × K[BN×HD]^T → scores[BM×BN] ----
-        // BN=64 = 4×WK: 4 WMMA tiles along the N dimension.
-        // qk_sub[f]: m16n16k16 accumulator covering cols [f*16..(f+1)*16-1]
+        // ---- WMMA QK^T + in-register softmax + rescale ----
+        // Uses fragment layout: row_a = lane/4, row_b = lane/4+8, 4 lanes per row.
+        // Each lane holds 16 scores per row (4 tiles × 4 elements).
+        // Cross-lane reduction via __shfl_xor_sync with offsets 1,2.
         if (wr < seq_len) {
             wmma::fragment<wmma::accumulator, BM, WK, WK, float> qk_sub[NQK];
 #pragma unroll
@@ -258,8 +256,7 @@ __global__ void sparse_attn_wmma_full_fp16(
                 }
             }
 
-            // Write scores to smem_p with mask applied (read mask from smem_mask)
-            // qk_sub[f] covers output cols [f*WK .. (f+1)*WK-1]
+            // Apply mask + scale in-register on fragment elements
 #pragma unroll
             for (int f = 0; f < NQK; f++) {
 #pragma unroll
@@ -267,90 +264,82 @@ __global__ void sparse_attn_wmma_full_fp16(
                     int fr  = lane / 4 + ((i & 2) ? 8 : 0);
                     int fc  = f * WK + (lane % 4) * 2 + wmma_col_off[i];
                     int gr2 = wr + fr;
-                    // Read mask from smem: fc in [0,64), word index = fc/32, bit = fc%32
                     bool ok = (gr2 < seq_len) && (cs + fc < seq_len) &&
                               ((smem_mask[wid * BM + fr][fc / 32] >> (fc % 32)) & 1u);
-                    float sv = ok ? (qk_sub[f].x[i] * scale) : -65504.f;
-                    smem_p[wid][fr][fc] = __float2half(sv);
-                }
-            }
-        }
-        __syncwarp();
-
-        // ---- Softmax: 32 lanes, 2 lanes per row, each handles BN/2=32 scores ----
-        // Round 22: merge sc[] and pv[] into one array to save 32 float regs
-        {
-            const int srow = lane % BM;
-            const int shalf = lane / BM;
-            const int sbase = shalf * (BN/2);
-            const int grow_s = wr + srow;
-            const bool sv = (wr < seq_len) && (grow_s < seq_len);
-
-            float old_max = sv ? smem_max[wid][srow] : -65504.f;
-            float old_sum = sv ? smem_sum[wid][srow] : 0.f;
-
-            constexpr int HALF_BN = BN / 2;
-            float sc[HALF_BN];
-            if (sv) {
-#pragma unroll
-                for (int j = 0; j < HALF_BN; j++)
-                    sc[j] = __half2float(smem_p[wid][srow][sbase + j]);
-            }
-
-            float local_max = -65504.f;
-            if (sv) {
-#pragma unroll
-                for (int j = 0; j < HALF_BN; j++)
-                    local_max = fmaxf(local_max, sc[j]);
-            }
-
-            float partner_max = __shfl_xor_sync(0xffffffff, local_max, BM);
-            float nm = fmaxf(fmaxf(local_max, partner_max), old_max);
-
-            float rsc = (old_max > -65000.f) ? expf(old_max - nm) : 1.f;
-            if (shalf == 0 && sv) smem_rsc[wid][srow] = rsc;
-
-            float local_sum = 0.f;
-            if (sv) {
-#pragma unroll
-                for (int j = 0; j < HALF_BN; j++) {
-                    sc[j] = (sc[j] > -65000.f) ? expf(sc[j] - nm) : 0.f;
-                    local_sum += sc[j];
+                    qk_sub[f].x[i] = ok ? (qk_sub[f].x[i] * scale) : -65504.f;
                 }
             }
 
-            float partner_sum = __shfl_xor_sync(0xffffffff, local_sum, BM);
-            float ns = old_sum * rsc + local_sum + partner_sum;
-
-            if (shalf == 0 && sv) {
-                smem_max[wid][srow] = nm;
-                smem_sum[wid][srow] = ns;
-            }
-
-            if (sv) {
+            // ---- In-register softmax: find max per row ----
+            float local_max_a = -65504.f, local_max_b = -65504.f;
 #pragma unroll
-                for (int j = 0; j < HALF_BN; j++)
-                    smem_p[wid][srow][sbase + j] = __float2half(sc[j]);
+            for (int f = 0; f < NQK; f++) {
+                local_max_a = fmaxf(local_max_a, fmaxf(fmaxf(qk_sub[f].x[0], qk_sub[f].x[1]),
+                                                         fmaxf(qk_sub[f].x[4], qk_sub[f].x[5])));
+                local_max_b = fmaxf(local_max_b, fmaxf(fmaxf(qk_sub[f].x[2], qk_sub[f].x[3]),
+                                                         fmaxf(qk_sub[f].x[6], qk_sub[f].x[7])));
             }
-        }
-        __syncwarp();
+            local_max_a = fmaxf(local_max_a, __shfl_xor_sync(0xffffffff, local_max_a, 1));
+            local_max_a = fmaxf(local_max_a, __shfl_xor_sync(0xffffffff, local_max_a, 2));
+            local_max_b = fmaxf(local_max_b, __shfl_xor_sync(0xffffffff, local_max_b, 1));
+            local_max_b = fmaxf(local_max_b, __shfl_xor_sync(0xffffffff, local_max_b, 2));
 
-        // ---- Rescale acc_frag using smem_rsc ----
-        if (wr < seq_len) {
+            float nm_a = fmaxf(local_max_a, old_max_a);
+            float nm_b = fmaxf(local_max_b, old_max_b);
+            float rsc_a = (old_max_a > -65000.f) ? expf(old_max_a - nm_a) : 1.f;
+            float rsc_b = (old_max_b > -65000.f) ? expf(old_max_b - nm_b) : 1.f;
+
+            // ---- Rescale acc_frag before accumulating new tile ----
 #pragma unroll
             for (int f = 0; f < NF; f++) {
 #pragma unroll
                 for (int i = 0; i < 8; i++) {
+                    acc_frag[f].x[i] *= ((i & 2) ? rsc_b : rsc_a);
+                }
+            }
+
+            // ---- exp + local sum ----
+            float local_sum_a = 0.f, local_sum_b = 0.f;
+#pragma unroll
+            for (int f = 0; f < NQK; f++) {
+                qk_sub[f].x[0] = (qk_sub[f].x[0] > -65000.f) ? expf(qk_sub[f].x[0] - nm_a) : 0.f;
+                qk_sub[f].x[1] = (qk_sub[f].x[1] > -65000.f) ? expf(qk_sub[f].x[1] - nm_a) : 0.f;
+                qk_sub[f].x[4] = (qk_sub[f].x[4] > -65000.f) ? expf(qk_sub[f].x[4] - nm_a) : 0.f;
+                qk_sub[f].x[5] = (qk_sub[f].x[5] > -65000.f) ? expf(qk_sub[f].x[5] - nm_a) : 0.f;
+                local_sum_a += qk_sub[f].x[0] + qk_sub[f].x[1] + qk_sub[f].x[4] + qk_sub[f].x[5];
+
+                qk_sub[f].x[2] = (qk_sub[f].x[2] > -65000.f) ? expf(qk_sub[f].x[2] - nm_b) : 0.f;
+                qk_sub[f].x[3] = (qk_sub[f].x[3] > -65000.f) ? expf(qk_sub[f].x[3] - nm_b) : 0.f;
+                qk_sub[f].x[6] = (qk_sub[f].x[6] > -65000.f) ? expf(qk_sub[f].x[6] - nm_b) : 0.f;
+                qk_sub[f].x[7] = (qk_sub[f].x[7] > -65000.f) ? expf(qk_sub[f].x[7] - nm_b) : 0.f;
+                local_sum_b += qk_sub[f].x[2] + qk_sub[f].x[3] + qk_sub[f].x[6] + qk_sub[f].x[7];
+            }
+
+            // Cross-lane sum reduction (4 lanes per row, xor 1 then 2)
+            local_sum_a += __shfl_xor_sync(0xffffffff, local_sum_a, 1);
+            local_sum_a += __shfl_xor_sync(0xffffffff, local_sum_a, 2);
+            local_sum_b += __shfl_xor_sync(0xffffffff, local_sum_b, 1);
+            local_sum_b += __shfl_xor_sync(0xffffffff, local_sum_b, 2);
+
+            old_sum_a = old_sum_a * rsc_a + local_sum_a;
+            old_sum_b = old_sum_b * rsc_b + local_sum_b;
+            old_max_a = nm_a;
+            old_max_b = nm_b;
+
+            // ---- Write post-softmax P to smem_p for PV WMMA ----
+#pragma unroll
+            for (int f = 0; f < NQK; f++) {
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
                     int fr = lane / 4 + ((i & 2) ? 8 : 0);
-                    acc_frag[f].x[i] *= smem_rsc[wid][fr];
+                    int fc = f * WK + (lane % 4) * 2 + wmma_col_off[i];
+                    smem_p[wid][fr][fc] = __float2half(qk_sub[f].x[i]);
                 }
             }
         }
+        __syncwarp();
 
         // ---- WMMA PV: P[BM×BN=64] × V[BN=64×HD=64] → acc_frag[NF] ----
-        // P is split into NQK=4 sub-tiles of width WK=16 along the K dimension.
-        // acc_frag[f] covers output cols [f*WK .. (f+1)*WK-1].
-        // PV = sum over k: P_sub[k] × V_sub[k][f*WK..(f+1)*WK-1]
         if (wr < seq_len) {
 #pragma unroll
             for (int f = 0; f < NF; f++) {
@@ -377,17 +366,16 @@ __global__ void sparse_attn_wmma_full_fp16(
                 int gr2  = wr + fr;
                 int gc2  = f * WK + fc;
                 if (gr2 < seq_len) {
-                    float s = smem_sum[wid][fr];
+                    float s = ((i & 2) ? old_sum_b : old_sum_a);
                     float out_val = (s > 0.f) ? (acc_frag[f].x[i] / s) : 0.f;
                     Obh[gr2 * HD + gc2] = __float2half(out_val);
                 }
-                if (save_lse && LSE && f == 0 && i == 0) {
-                    // fc==0 when lane%4==0 && wmma_col_off[0]==0, but i==0 always fc=col_off[0]=0
-                    // Only write LSE for fc=0 column (one thread per row)
-                    if (fc == 0 && gr2 < seq_len) {
+                if (save_lse && LSE && f == 0 && (i == 0 || i == 2)) {
+                    int fc_lse = (lane % 4) * 2 + wmma_col_off[i];
+                    if (fc_lse == 0 && gr2 < seq_len) {
                         int li = (batch_id * num_heads + head_id) * seq_len + gr2;
-                        float m = smem_max[wid][fr];
-                        float s = smem_sum[wid][fr];
+                        float m = ((i & 2) ? old_max_b : old_max_a);
+                        float s = ((i & 2) ? old_sum_b : old_sum_a);
                         LSE[li] = m + logf(fmaxf(s, 1e-30f));
                     }
                 }
