@@ -1,21 +1,13 @@
 /*
  * Sparse Mask Attention - CUDA Kernel
  *
- * Round 18: BN 16→64 (larger tile, fewer loop iterations, fewer syncs)
- *   (builds on Round 15: cp.async + smem_p padding)
+ * Round 19: Pad smem_q/k/v inner dim by 8 to eliminate bank conflicts
+ *   (builds on Round 18: BN=64 large tile)
  *
- * Architecture:
- *   - 4 warps per block, each warp handles 16 rows of Q (BM=16)
- *   - BN=64: each tile covers 64 K/V columns (vs 16 before)
- *     → loop iterations: N/64 (e.g. 8 for N=512, vs 32 before)
- *     → __syncthreads() calls: ~2×8=16 (vs 2×32=64 before)
- *   - QK^T: 4 WMMA tiles (NQK=4) each m16n16k16 → score sub-tiles side by side
- *     result: smem_p[wid][BM][BN=64] via 4×WMMA writes
- *   - Softmax: scalar over BN=64 scores per row
- *   - PV: P[BM×BN=64] × V[BN=64×HD=64] → NF=4 acc_frag[f] (BM×16 each)
- *     each PV WMMA: P_sub[BM×16] (4 sub-tiles) × V_sub[16×16] → acc_frag[f]
- *   - Fragment rescale via smem_rsc[warp][row]
- *   - Output written directly from fragment elements to global memory
+ * Key change: smem_q/k/v stride 64→72 halves (144 bytes/row).
+ *   144/4 = 36 bank slots, 36%32 = 4 → consecutive rows shift 4 banks.
+ *   Reduces 16-way bank conflicts to 2-way for all WMMA loads.
+ *   Profile showed 50M smem load conflicts; ~84% from K/V, ~10% from Q.
  *
  * Key WMMA accumulator element layout (m16n16k16, float, row_major):
  *   frag.x[i], lane L:
@@ -116,16 +108,15 @@ __global__ void sparse_attn_wmma_full_fp16(
     const int nw  = (seq_len + 31) / 32;
     const uint32_t* Mbh = mask_packed + (batch_id * num_heads + head_id) * seq_len * nw;
 
-    // ---- Shared memory (Round 18: BN=64, single-buffer K/V, padded P) ----
-    // PP=8: pad smem_p column so BN+PP = 72 halves/row (144 bytes).
-    //   72 % 8 = 0 → WMMA stride ok; row size 144B → banks spread for 4-byte fp16 banks.
-    // smem_k/smem_v: single buffer (no double-buffering; focus on fewer iterations).
-    //   BN=64 → smem_k/v each 64×64×2 = 8192 B. Total smem ≈ 34 KB.
-    constexpr int PP = 8;  // smem_p column padding (72 halves = 144 bytes per row)
-    __shared__ __align__(16) __half smem_q[NWARPS][BM][HD];           // Q tiles
-    __shared__ __align__(16) __half smem_k[BN][HD];                   // K single-buffer
-    __shared__ __align__(16) __half smem_v[BN][HD];                   // V single-buffer
-    __shared__ __align__(16) __half smem_p[NWARPS][BM][BN + PP];     // scores P (padded)
+    // ---- Shared memory (Round 19: pad K/V inner dim to eliminate bank conflicts) ----
+    // PP=8: pad smem_p/q/k/v columns so stride = 72 halves (144 bytes).
+    //   144 / 4 = 36 bank slots per row, 36 % 32 = 4 → consecutive rows shift 4 banks.
+    //   Reduces 16-way bank conflicts to 2-way for WMMA loads.
+    constexpr int PP = 8;  // column padding for all smem arrays
+    __shared__ __align__(16) __half smem_q[NWARPS][BM][HD + PP];     // Q tiles (padded)
+    __shared__ __align__(16) __half smem_k[BN][HD + PP];             // K single-buffer (padded)
+    __shared__ __align__(16) __half smem_v[BN][HD + PP];             // V single-buffer (padded)
+    __shared__ __align__(16) __half smem_p[NWARPS][BM][BN + PP];    // scores P (padded)
     __shared__ float     smem_max[NWARPS][BM];
     __shared__ float     smem_sum[NWARPS][BM];
     __shared__ float     smem_rsc[NWARPS][BM];
@@ -247,11 +238,11 @@ __global__ void sparse_attn_wmma_full_fp16(
 #pragma unroll
             for (int kk = 0; kk < HD; kk += WK) {
                 wmma::fragment<wmma::matrix_a, BM, WK, WK, __half, wmma::row_major> a;
-                wmma::load_matrix_sync(a, &smem_q[wid][0][kk], HD);
+                wmma::load_matrix_sync(a, &smem_q[wid][0][kk], HD + PP);
 #pragma unroll
                 for (int f = 0; f < NQK; f++) {
                     wmma::fragment<wmma::matrix_b, WK, WK, WK, __half, wmma::col_major> b;
-                    wmma::load_matrix_sync(b, &smem_k[f * WK][kk], HD);
+                    wmma::load_matrix_sync(b, &smem_k[f * WK][kk], HD + PP);
                     wmma::mma_sync(qk_sub[f], a, b, qk_sub[f]);
                 }
             }
@@ -332,7 +323,7 @@ __global__ void sparse_attn_wmma_full_fp16(
                     wmma::fragment<wmma::matrix_a, BM, WK, WK, __half, wmma::row_major> pa;
                     wmma::fragment<wmma::matrix_b, WK, WK, WK, __half, wmma::row_major> vb;
                     wmma::load_matrix_sync(pa, &smem_p[wid][0][k * WK], BN + PP);
-                    wmma::load_matrix_sync(vb, &smem_v[k * WK][f * WK], HD);
+                    wmma::load_matrix_sync(vb, &smem_v[k * WK][f * WK], HD + PP);
                     wmma::mma_sync(acc_frag[f], pa, vb, acc_frag[f]);
                 }
             }
