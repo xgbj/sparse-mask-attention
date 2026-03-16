@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Sparse Mask Attention — 原理图</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #F0F4FF;
+    font-family: 'Segoe UI', 'PingFang SC', sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 32px 20px 48px;
+    min-height: 100vh;
+  }
+
+  h1 {
+    font-size: 26px;
+    color: #1A1A2E;
+    margin-bottom: 6px;
+    letter-spacing: 0.5px;
+  }
+  .subtitle {
+    font-size: 13px;
+    color: #667788;
+    margin-bottom: 32px;
+  }
+
+  .flow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    width: 680px;
+  }
+
+  /* ── input row ── */
+  .inputs {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 0;
+    width: 100%;
+    justify-content: center;
+  }
+  .input-chip {
+    background: #1565C0;
+    color: white;
+    border-radius: 16px;
+    padding: 10px 22px;
+    font-size: 18px;
+    font-weight: 700;
+    box-shadow: 0 4px 12px #1565C044;
+    letter-spacing: 1px;
+  }
+  .mask-chip {
+    background: #455A64;
+    color: white;
+    border-radius: 16px;
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    box-shadow: 0 4px 12px #45454444;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .arrow-down {
+    width: 3px;
+    height: 28px;
+    background: linear-gradient(to bottom, #AAB, #778);
+    position: relative;
+    margin: 0 auto;
+  }
+  .arrow-down::after {
+    content: '';
+    position: absolute;
+    bottom: -8px;
+    left: 50%;
+    transform: translateX(-50%);
+    border-left: 8px solid transparent;
+    border-right: 8px solid transparent;
+    border-top: 10px solid #778;
+  }
+
+  /* ── step card ── */
+  .step {
+    width: 100%;
+    border-radius: 18px;
+    padding: 16px 24px;
+    color: white;
+    box-shadow: 0 6px 20px #00000022;
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+  }
+  .step-num {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.25);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    font-weight: 800;
+    flex-shrink: 0;
+    border: 2px solid rgba(255,255,255,0.5);
+  }
+  .step-body { flex: 1; }
+  .step-title {
+    font-size: 16px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .step-desc {
+    font-size: 12.5px;
+    opacity: 0.88;
+    line-height: 1.5;
+  }
+
+  /* colors */
+  .s-red    { background: linear-gradient(135deg, #C62828, #E53935); }
+  .s-green  { background: linear-gradient(135deg, #2E7D32, #43A047); }
+  .s-orange { background: linear-gradient(135deg, #E65100, #FB8C00); }
+  .s-purple { background: linear-gradient(135deg, #6A1B9A, #8E24AA); }
+  .s-teal   { background: linear-gradient(135deg, #00695C, #00897B); }
+
+  /* skip badge */
+  .skip-badge {
+    position: absolute;
+    right: -110px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: #C62828;
+    color: white;
+    border-radius: 12px;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+    box-shadow: 0 3px 10px #C6282844;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .skip-badge::before {
+    content: '';
+    position: absolute;
+    left: -10px;
+    top: 50%;
+    transform: translateY(-50%);
+    border-top: 7px solid transparent;
+    border-bottom: 7px solid transparent;
+    border-right: 10px solid #C62828;
+  }
+
+  /* loop bracket */
+  .loop-wrap {
+    position: relative;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+  }
+  .loop-label {
+    position: absolute;
+    left: -88px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 12px;
+    color: #667;
+    font-style: italic;
+    text-align: right;
+    line-height: 1.5;
+    border-right: 3px dashed #AABBCC;
+    padding-right: 10px;
+  }
+  .loop-bracket {
+    position: absolute;
+    left: -18px;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    border: 2.5px dashed #AABBCC;
+    border-right: none;
+    border-radius: 6px 0 0 6px;
+  }
+
+  /* result */
+  .result {
+    width: 100%;
+    background: linear-gradient(135deg, #1A237E, #283593);
+    border-radius: 20px;
+    padding: 20px 28px;
+    color: white;
+    box-shadow: 0 8px 28px #1A237E55;
+    text-align: center;
+    margin-top: 4px;
+  }
+  .result-title { font-size: 13px; color: #90CAF9; margin-bottom: 6px; }
+  .result-main  { font-size: 22px; font-weight: 800; color: #FFD700; margin-bottom: 8px; }
+  .result-sub   { font-size: 13px; color: #B3C5FF; line-height: 1.8; }
+
+  /* bit-pack annotation */
+  .pack-note {
+    font-size: 11px;
+    color: #C62828;
+    font-weight: 600;
+    margin-left: 6px;
+  }
+
+  .spacer { height: 20px; }
+  .spacer-sm { height: 10px; }
+</style>
+</head>
+<body>
+
+<h1>Sparse Mask Attention</h1>
+<p class="subtitle">CUDA Kernel 原理图 &nbsp;·&nbsp; RTX 3080 &nbsp;·&nbsp; FP16 &nbsp;·&nbsp; Tensor Core</p>
+
+<div class="flow">
+
+  <!-- Inputs -->
+  <div class="inputs">
+    <div class="input-chip">Q</div>
+    <div class="input-chip">K</div>
+    <div class="input-chip">V</div>
+    <div style="width:20px"></div>
+    <div class="mask-chip">
+      bool Mask
+      <span class="pack-note">→ bit-pack → uint32<br>8× 内存节省</span>
+    </div>
+  </div>
+
+  <div class="arrow-down" style="height:32px"></div>
+
+  <!-- Loop wrapper -->
+  <div class="loop-wrap">
+    <div class="loop-bracket"></div>
+    <div class="loop-label">for each<br>K/V tile<br>×8 tiles</div>
+
+    <!-- Step 1: Skip check -->
+    <div class="step s-red" style="position:relative">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <div class="step-title">稀疏跳过检查</div>
+        <div class="step-desc">读取 packed mask bits &nbsp;→&nbsp; warp 投票<br>若整个 tile 全被 mask &nbsp;→&nbsp; 直接跳过，不做任何计算</div>
+      </div>
+      <div class="skip-badge">SKIP ✕</div>
+    </div>
+
+    <div class="arrow-down"></div>
+
+    <!-- Step 2: QK^T -->
+    <div class="step s-green">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <div class="step-title">QK&#x1D40; &nbsp;矩阵乘法 &nbsp;(Tensor Core)</div>
+        <div class="step-desc">Q tile × K tile&#x1D40; &nbsp;→&nbsp; 注意力分数矩阵<br>WMMA m16n16k16，FP16 输入 / FP32 累加</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"></div>
+
+    <!-- Step 3: Apply mask -->
+    <div class="step s-orange">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <div class="step-title">施加 Mask</div>
+        <div class="step-desc">被 mask 的位置 &nbsp;→&nbsp; score = −∞<br>保留的位置 &nbsp;→&nbsp; 保持原分数</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"></div>
+
+    <!-- Step 4: Softmax -->
+    <div class="step s-purple">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <div class="step-title">Online Softmax</div>
+        <div class="step-desc">exp(score − max) / sum<br>每个 tile 更新 running max & sum，无需存全部分数</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"></div>
+
+    <!-- Step 5: PV -->
+    <div class="step s-green">
+      <div class="step-num">5</div>
+      <div class="step-body">
+        <div class="step-title">P × V &nbsp;矩阵乘法 &nbsp;(Tensor Core)</div>
+        <div class="step-desc">注意力权重 × V tile &nbsp;→&nbsp; 累加到输出<br>WMMA m16n16k16，结果持续累积</div>
+      </div>
+    </div>
+
+  </div><!-- end loop-wrap -->
+
+  <div class="arrow-down" style="height:32px"></div>
+
+  <!-- Step 6: Normalize -->
+  <div class="step s-teal">
+    <div class="step-num">6</div>
+    <div class="step-body">
+      <div class="step-title">归一化 &nbsp;+&nbsp; 写出结果</div>
+      <div class="step-desc">output = accumulator / sum &nbsp;→&nbsp; FP16 &nbsp;→&nbsp; Out[B, H, N, D]</div>
+    </div>
+  </div>
+
+  <div class="arrow-down" style="height:32px"></div>
+
+  <!-- Result -->
+  <div class="result">
+    <div class="result-title">最终性能 &nbsp;(B=16, N=512, H=12, D=64, sparsity=75%)</div>
+    <div class="result-main">0.571 ms &nbsp;·&nbsp; 22.58 TFLOPS &nbsp;·&nbsp; 29× 提速</div>
+    <div class="result-sub">
+      vs Triton &nbsp;<b style="color:#FFD700">1.44×</b> &nbsp;&nbsp;
+      vs cuDNN SDPA &nbsp;<b style="color:#FFD700">1.56×</b> &nbsp;&nbsp;
+      vs FlashInfer &nbsp;<b style="color:#FFD700">1.82×</b> &nbsp;&nbsp;
+      vs PyTorch Ref &nbsp;<b style="color:#FFD700">4.02×</b>
+    </div>
+  </div>
+
+</div><!-- end flow -->
+
+</body>
+</html>
