@@ -5,9 +5,7 @@
     python run.py              # 正确性 + 性能
     python run.py --mode correctness
     python run.py --mode perf
-    python run.py --mode flash_correctness   # 仅测试 flash_attention
-    python run.py --mode flash_perf          # 仅测试 flash_attention 性能
-    python run.py --mode compare             # 横向对比 ours/triton/cudnn/flashinfer
+    python run.py --mode compare             # 横向对比 ours/triton/cudnn/flashinfer/flash-attn
 """
 
 import argparse
@@ -26,6 +24,7 @@ except ImportError:
 
 try:
     from flashinfer import single_prefill_with_kv_cache as fi_single_prefill
+    from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper as FiBatchPrefill
     HAS_FLASHINFER = True
 except ImportError:
     HAS_FLASHINFER = False
@@ -197,8 +196,10 @@ def get_peak_tflops_tc():
     return GPU_INFO["fp16_tc_tflops"]
 
 
-def compute_mfu(latency_ms, B, H, N, D, sparsity, peak_tflops):
-    flops = 4 * B * H * N * N * D * (1.0 - sparsity)
+def compute_mfu(latency_ms, B, H, N, D, peak_tflops):
+    # 理论 FLOPs: QK^T (B*H*N*N*D) + softmax (B*H*N) + attn@V (B*H*N*N*D) = 4*B*H*N*N*D
+    # sparsity 不影响理论 FLOPs，只是实际计算时跳过一些元素
+    flops = 4 * B * H * N * N * D
     tflops = flops / (latency_ms / 1000.0) / 1e12
     return tflops, tflops / peak_tflops * 100.0
 
@@ -432,7 +433,7 @@ def run_perf():
         v = torch.randn(B, H, N, D, device=device, dtype=dtype)
         mask = generate_mask(B, H, N, sparsity=sparsity, device=device)
         lat = measure_latency(lambda: sparse_attention_cuda_fwd(q, k, v, mask))
-        tflops, mfu = compute_mfu(lat, B, H, N, D, sparsity, peak)
+        tflops, mfu = compute_mfu(lat, B, H, N, D, peak)
         print(f"  {N:>6}  {lat:>12.3f}  {tflops:>8.2f}  {mfu:>7.1f}%")
 
     # --- Batch size 缩放 ---
@@ -446,7 +447,7 @@ def run_perf():
         v = torch.randn(B, H, N, D, device=device, dtype=dtype)
         mask = generate_mask(B, H, N, sparsity=sparsity, device=device)
         lat = measure_latency(lambda: sparse_attention_cuda_fwd(q, k, v, mask))
-        tflops, mfu = compute_mfu(lat, B, H, N, D, sparsity, peak)
+        tflops, mfu = compute_mfu(lat, B, H, N, D, peak)
         seqs = B / (lat / 1000.0)
         print(f"  {B:>6}  {lat:>12.3f}  {tflops:>8.2f}  {mfu:>7.1f}%  {seqs:>10.0f}")
 
@@ -460,8 +461,8 @@ def run_perf():
 
     lat_ours = measure_latency(lambda: sparse_attention_cuda_fwd(q, k, v, mask))
     lat_pt = measure_latency(lambda: sparse_attention_ref(q, k, v, mask), warmup=3, repeat=10)
-    tflops_ours, mfu_ours = compute_mfu(lat_ours, B, H, N, D, sparsity, peak)
-    tflops_pt, mfu_pt = compute_mfu(lat_pt, B, H, N, D, sparsity, peak_tc)
+    tflops_ours, mfu_ours = compute_mfu(lat_ours, B, H, N, D, peak)
+    tflops_pt, mfu_pt = compute_mfu(lat_pt, B, H, N, D, peak_tc)
     print(f"  Ours:        {lat_ours:.3f} ms  ({tflops_ours:.2f} TFLOPS)")
     print(f"  PyTorch Ref: {lat_pt:.3f} ms  ({tflops_pt:.2f} TFLOPS)  speedup={lat_pt/lat_ours:.2f}x")
 
@@ -470,8 +471,36 @@ def run_perf():
         _ = sparse_attention_triton(q, k, v, mask)
         torch.cuda.synchronize()
         lat_triton = measure_latency(lambda: sparse_attention_triton(q, k, v, mask), warmup=5, repeat=20)
-        tflops_triton, _ = compute_mfu(lat_triton, B, H, N, D, sparsity, peak_tc)
+        tflops_triton, _ = compute_mfu(lat_triton, B, H, N, D, peak_tc)
         print(f"  Triton:      {lat_triton:.3f} ms  ({tflops_triton:.2f} TFLOPS)  speedup={lat_triton/lat_ours:.2f}x")
+
+    # cuDNN SDPA (dense, 不支持自定义 sparse mask)
+    if HAS_SDPA_CUDNN:
+        try:
+            lat_cudnn = measure_latency(lambda: cudnn_attention_fwd(q, k, v, mask), warmup=5, repeat=20)
+            tflops_cudnn, _ = compute_mfu(lat_cudnn, B, H, N, D, peak_tc)
+            print(f"  cuDNN SDPA: {lat_cudnn:.3f} ms  ({tflops_cudnn:.2f} TFLOPS)  speedup={lat_cudnn/lat_ours:.2f}x (dense)")
+        except Exception as e:
+            print(f"  cuDNN SDPA: [ERROR] {e}")
+
+    # FlashInfer
+    if HAS_FLASHINFER:
+        try:
+            lat_fi = measure_latency(lambda: flashinfer_attention_fwd(q, k, v, mask), warmup=3, repeat=10)
+            tflops_fi, _ = compute_mfu(lat_fi, B, H, N, D, peak_tc)
+            print(f"  FlashInfer: {lat_fi:.3f} ms  ({tflops_fi:.2f} TFLOPS)  speedup={lat_fi/lat_ours:.2f}x")
+        except Exception as e:
+            print(f"  FlashInfer: [ERROR] {e}")
+
+    # flash-attn (无 custom mask, dense baseline)
+    if HAS_FLASH_ATTN:
+        try:
+            lat_flash = measure_latency(lambda: flash_attn_pkg_fwd(q, k, v, mask), warmup=5, repeat=20)
+            tflops_flash, _ = compute_mfu(lat_flash, B, H, N, D, peak_tc)
+            print(f"  flash-attn: {lat_flash:.3f} ms  ({tflops_flash:.2f} TFLOPS)  speedup={lat_flash/lat_ours:.2f}x (dense)")
+        except Exception as e:
+            print(f"  flash-attn: [ERROR] {e}")
+
     print()
 
 # ============================================================
@@ -516,62 +545,41 @@ def cudnn_math_attention_fwd(q, k, v, mask):
 
 def flashinfer_attention_fwd(q, k, v, mask):
     """
-    FlashInfer single_prefill_with_kv_cache 后端。
+    FlashInfer BatchPrefillWithRaggedKVCache 后端。
     q, k, v : [B, H, N, D]  FP16 (NHD layout internally)
     mask    : [B, H, N, N]  bool  (True=attend)
     返回     : [B, H, N, D]
 
-    FlashInfer 输入格式: [seq_len, num_heads, head_dim] (NHD)
-    每个 batch 元素和 head 单独调用 single_prefill_with_kv_cache。
+    将 B*H 展平为 batch 维度，每个 "sequence" 用 1 个 head，
+    一次 kernel launch 处理所有 (batch, head) 对。
     """
     if not HAS_FLASHINFER:
         raise RuntimeError("flashinfer not installed, run: pip install flashinfer-python")
     B, H, N, D = q.shape
-    out = torch.empty_like(q)
-    # FlashInfer 不支持 batch+multi-head 的 custom_mask，需要逐 (b,h) 调用
-    # 但对于性能测试，我们用整个序列展平后调用（忽略 B/H 维）
-    # 为了正确支持 [B,H] 维度，逐 batch 调用，每次传入 [N, H, D] 和 [H,N,N] mask
-    for b in range(B):
-        # q_b: [N, H, D] (NHD layout)
-        q_b = q[b].permute(1, 0, 2).contiguous()   # [N, H, D]
-        k_b = k[b].permute(1, 0, 2).contiguous()
-        v_b = v[b].permute(1, 0, 2).contiguous()
-        # FlashInfer single_prefill 对于 multi-head，mask 是 [N, N]（shared across heads）
-        # 我们取 batch b 的 head-averaged mask（对于公平比较，用 union mask）
-        # 实际上 flashinfer 的 custom_mask 是 [qo_len, kv_len] 用于所有 heads
-        # 此处取第一个 head 的 mask 作为代表（与 correctness 无关，仅用于性能比较）
-        mask_b = mask[b, 0]  # [N, N] — 性能测试用，近似处理
-        out_b = fi_single_prefill(
-            q_b, k_b, v_b,
-            custom_mask=mask_b,
-            kv_layout='NHD',
-        )  # [N, H, D]
-        out[b] = out_b.permute(1, 0, 2)
-    return out
+    num_seqs = B * H
 
+    # [B, H, N, D] -> [B*H, N, 1, D] -> [B*H*N, 1, D]
+    q_fi = q.reshape(num_seqs, N, D).unsqueeze(2).reshape(num_seqs * N, 1, D).contiguous()
+    k_fi = k.reshape(num_seqs, N, D).unsqueeze(2).reshape(num_seqs * N, 1, D).contiguous()
+    v_fi = v.reshape(num_seqs, N, D).unsqueeze(2).reshape(num_seqs * N, 1, D).contiguous()
 
-def flashinfer_attention_fwd_batch(q, k, v, mask):
-    """
-    FlashInfer BatchPrefillWithRaggedKVCache 后端（支持完整 B×H mask）。
-    为简化实现，逐 (b,h) 调用，适合公平的性能对比。
-    """
-    if not HAS_FLASHINFER:
-        raise RuntimeError("flashinfer not installed")
-    B, H, N, D = q.shape
-    out = torch.empty_like(q)
-    for b in range(B):
-        for h in range(H):
-            q_bh = q[b, h].unsqueeze(1).contiguous()   # [N, 1, D]
-            k_bh = k[b, h].unsqueeze(1).contiguous()
-            v_bh = v[b, h].unsqueeze(1).contiguous()
-            mask_bh = mask[b, h]                        # [N, N]
-            out_bh = fi_single_prefill(
-                q_bh, k_bh, v_bh,
-                custom_mask=mask_bh,
-                kv_layout='NHD',
-            )  # [N, 1, D]
-            out[b, h] = out_bh.squeeze(1)
-    return out
+    # indptr: each of B*H sequences has length N
+    qo_indptr = torch.arange(0, (num_seqs + 1) * N, N, device=q.device, dtype=torch.int32)
+    kv_indptr = qo_indptr
+
+    # mask [B, H, N, N] -> [B*H*N*N] flattened
+    mask_flat = mask.reshape(-1).contiguous()
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    wrapper = FiBatchPrefill(workspace, "NHD")
+    wrapper.plan(
+        qo_indptr, kv_indptr,
+        num_qo_heads=1, num_kv_heads=1,
+        head_dim_qk=D,
+        custom_mask=mask_flat,
+    )
+    o_fi = wrapper.run(q_fi, k_fi, v_fi)  # [B*H*N, 1, D]
+    return o_fi.reshape(B, H, N, D)
 
 
 # ============================================================
@@ -609,11 +617,10 @@ def run_compare():
     对比所有可用后端的延迟和吞吐量。
     后端列表：
       - Ours (csrc/sparse_attn_cuda)
-      - Our Flash Attn (flash_attention/)
       - Triton (if available)
       - cuDNN SDPA (torch.nn.attention.sdpa_kernel)
       - FlashInfer (flashinfer-python, per-batch loop)
-      - flash-attn pkg (if installed, no custom mask)
+      - flash-attn pkg (if installed, no custom mask, dense baseline)
     """
     print("=" * 80)
     print("横向性能对比 — 所有可用后端")
@@ -749,7 +756,7 @@ def run_compare():
             wmup = 3 if "FlashInfer" in name else 10
             lat = measure_latency(lambda fn=fn, q=q_s, k=k_s, v=v_s, m=mask_s: fn(q, k, v, m),
                                   warmup=wmup, repeat=rpt)
-            tflops, _ = compute_mfu(lat, B_s, H, N_s, D, sparsity, peak_tc)
+            tflops, _ = compute_mfu(lat, B_s, H, N_s, D, peak_tc)
             results[name] = (lat, tflops)
         except Exception as e:
             results[name] = (None, None)

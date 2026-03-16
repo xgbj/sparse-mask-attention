@@ -109,6 +109,11 @@ __device__ __forceinline__ __half from_float_fp16(float x) {
     return __float2half(x);
 }
 
+template<typename T> __device__ __forceinline__ T from_float(float x);
+template<> __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float x) { return __float2bfloat16(x); }
+template<> __device__ __forceinline__ __half        from_float<__half>(float x)        { return __float2half(x); }
+template<> __device__ __forceinline__ float         from_float<float>(float x)         { return x; }
+
 // ============================================================
 // Shared memory 布局辅助
 // ============================================================
