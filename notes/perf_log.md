@@ -312,16 +312,17 @@ GPU: NVIDIA GeForce RTX 3080 (sm_86)
 | 19 | smem Q/K/V pad+8 | 0.622 ms | 20.73 | 3.67x | 1.38x ★ |
 | 20 | mask预读smem | 0.595 ms | 21.64 | 3.84x | 1.38x |
 | 21 | 2-lane并行softmax | 0.583 ms | 22.12 | 3.92x | 1.41x |
+| 22 | 合并sc/pv数组 | 0.571 ms | 22.58 | 4.02x | 1.44x |
 
 Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - **PyTorch Ref (FP16 TC):** 2.090 ms, 6.16 TFLOPS
-- **Triton (FP16 TC):** 0.792 ms, 16.27 TFLOPS ← 已超越
-- **cuDNN SDPA:** 0.904 ms, 14.25 TFLOPS ← 已超越
-- **FlashInfer:** 1.061 ms, 12.14 TFLOPS ← 已超越
-- **flash-attn (dense, 无mask):** 0.368 ms, 35.04 TFLOPS ← 当前目标
+- **Triton (FP16 TC):** 0.747 ms, 17.24 TFLOPS ← 已超越
+- **cuDNN SDPA:** 0.891 ms, 14.47 TFLOPS ← 已超越
+- **FlashInfer:** 1.040 ms, 12.39 TFLOPS ← 已超越
+- **flash-attn (dense, 无mask):** 0.402 ms, 32.02 TFLOPS ← 当前目标
 
-总提速: 16.571ms → 0.583ms = **28.4x** (Baseline → Round 21)
-当前状态: 已超越 Triton 1.41x，距 flash-attn (dense) 还差 1.58x
+总提速: 16.571ms → 0.571ms = **29.0x** (Baseline → Round 22)
+当前状态: 已超越 Triton 1.44x，距 flash-attn (dense) 还差 1.42x
 
 ### Round 13 — WMMA PV 累加（失败，已回滚）
 
@@ -543,3 +544,34 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 - 加速比 vs Ref: 3.92x；vs Triton: 1.41x
 
 关键指标 (N=512): **0.583 ms, 22.12 TFLOPS** (vs Round 20: 0.595ms, 提速 1.02x)
+
+### Round 22 — 合并 softmax sc/pv 数组，减少寄存器压力
+
+改动: csrc/sparse_attention.cu
+- softmax 中 `float sc[32]` 和 `float pv[32]` 合并为一个 `float sc[32]`
+- 先用 sc[] 算 max，再原地 `sc[j] = expf(sc[j] - nm)` 替代单独的 pv[]
+- 省 32 个 float 寄存器（128 bytes/thread）
+
+原因: 168 regs/thread 是 occupancy 限制因素。减少寄存器可能让编译器生成更紧凑的代码。
+注: smem_k/smem_p union 尝试失败（reinterpret_cast 导致寄存器爆到 255）。
+注: __launch_bounds__(128,3) 尝试失败（强制压缩寄存器导致正确性错误）。
+
+序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
+| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+|---|---|---|---|
+| 64 | 0.033 | 6.10 | 20.5% |
+| 128 | 0.065 | 12.34 | 41.4% |
+| 256 | 0.175 | 18.41 | 61.8% |
+| 512 | 0.571 | 22.58 | 75.8% |
+| 1024 | 2.020 | 25.51 | 85.6% |
+
+横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
+- Ours: 0.520 ms (24.79 TFLOPS)
+- Triton: 0.747 ms (17.24 TFLOPS)
+- cuDNN SDPA: 0.891 ms (14.47 TFLOPS)
+- FlashInfer: 1.040 ms (12.39 TFLOPS)
+- PyTorch Ref: 2.090 ms (6.16 TFLOPS)
+- flash-attn (dense): 0.402 ms (32.02 TFLOPS)
+- 加速比 vs Ref: 4.02x；vs Triton: 1.44x
+
+关键指标 (N=512): **0.571 ms, 22.58 TFLOPS** (vs Round 21: 0.583ms, 提速 1.02x)

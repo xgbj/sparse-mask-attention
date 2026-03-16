@@ -278,20 +278,18 @@ __global__ void sparse_attn_wmma_full_fp16(
         __syncwarp();
 
         // ---- Softmax: 32 lanes, 2 lanes per row, each handles BN/2=32 scores ----
-        // lane mapping: row = lane % BM, half = lane / BM (0 or 1)
-        // half=0 → scores[0..31], half=1 → scores[32..63]
+        // Round 22: merge sc[] and pv[] into one array to save 32 float regs
         {
-            const int srow = lane % BM;        // row index [0..15]
-            const int shalf = lane / BM;       // 0 or 1
-            const int sbase = shalf * (BN/2);  // 0 or 32
+            const int srow = lane % BM;
+            const int shalf = lane / BM;
+            const int sbase = shalf * (BN/2);
             const int grow_s = wr + srow;
             const bool sv = (wr < seq_len) && (grow_s < seq_len);
 
             float old_max = sv ? smem_max[wid][srow] : -65504.f;
             float old_sum = sv ? smem_sum[wid][srow] : 0.f;
 
-            // Load 32 scores from smem_p
-            constexpr int HALF_BN = BN / 2;  // 32
+            constexpr int HALF_BN = BN / 2;
             float sc[HALF_BN];
             if (sv) {
 #pragma unroll
@@ -299,7 +297,6 @@ __global__ void sparse_attn_wmma_full_fp16(
                     sc[j] = __half2float(smem_p[wid][srow][sbase + j]);
             }
 
-            // Local max over 32 scores
             float local_max = -65504.f;
             if (sv) {
 #pragma unroll
@@ -307,42 +304,33 @@ __global__ void sparse_attn_wmma_full_fp16(
                     local_max = fmaxf(local_max, sc[j]);
             }
 
-            // Merge max across 2 halves via shuffle (partner = lane ^ BM)
             float partner_max = __shfl_xor_sync(0xffffffff, local_max, BM);
-            float nm = fmaxf(local_max, partner_max);
-            // Also merge with old_max
-            nm = fmaxf(nm, old_max);
+            float nm = fmaxf(fmaxf(local_max, partner_max), old_max);
 
-            // Rescale factor
             float rsc = (old_max > -65000.f) ? expf(old_max - nm) : 1.f;
-            // Only half=0 writes smem_rsc (both halves have same rsc)
             if (shalf == 0 && sv) smem_rsc[wid][srow] = rsc;
 
             float local_sum = 0.f;
-            float pv[HALF_BN];
             if (sv) {
 #pragma unroll
                 for (int j = 0; j < HALF_BN; j++) {
-                    pv[j] = (sc[j] > -65000.f) ? expf(sc[j] - nm) : 0.f;
-                    local_sum += pv[j];
+                    sc[j] = (sc[j] > -65000.f) ? expf(sc[j] - nm) : 0.f;
+                    local_sum += sc[j];
                 }
             }
 
-            // Merge sum across 2 halves
             float partner_sum = __shfl_xor_sync(0xffffffff, local_sum, BM);
             float ns = old_sum * rsc + local_sum + partner_sum;
 
-            // Write back (only half=0 writes max/sum to avoid race)
             if (shalf == 0 && sv) {
                 smem_max[wid][srow] = nm;
                 smem_sum[wid][srow] = ns;
             }
 
-            // Write P values back to smem_p
             if (sv) {
 #pragma unroll
                 for (int j = 0; j < HALF_BN; j++)
-                    smem_p[wid][srow][sbase + j] = __float2half(pv[j]);
+                    smem_p[wid][srow][sbase + j] = __float2half(sc[j]);
             }
         }
         __syncwarp();

@@ -26,6 +26,7 @@ rounds = [
     (19, "R19 smem pad",     0.622, 20.73),
     (20, "R20 mask→smem",    0.595, 21.64),
     (21, "R21 2-lane sfmx",  0.583, 22.12),
+    (22, "R22 merge sc/pv",  0.571, 22.58),
 ]
 
 r_ids   = [r[0]  for r in rounds]
