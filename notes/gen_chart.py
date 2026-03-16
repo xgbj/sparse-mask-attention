@@ -27,6 +27,7 @@ rounds = [
     (20, "R20 mask→smem",    0.595, 21.64),
     (21, "R21 2-lane sfmx",  0.583, 22.12),
     (22, "R22 merge sc/pv",  0.571, 22.58),
+    (23, "R23 reg softmax",  0.512, 25.17),
 ]
 
 r_ids   = [r[0]  for r in rounds]
@@ -35,16 +36,16 @@ latency = [r[2]  for r in rounds]
 tflops  = [r[3]  for r in rounds]
 
 # Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75)
-TRITON_LAT   = 0.792
-TRITON_TFLOP = 16.27
-PT_REF_LAT   = 2.090
+TRITON_LAT   = 0.751
+TRITON_TFLOP = 17.15
+PT_REF_LAT   = 2.091
 PT_REF_TFLOP = 6.16
-CUDNN_LAT    = 0.904
-CUDNN_TFLOP  = 14.25
-FI_LAT       = 1.061
-FI_TFLOP     = 12.14
-FA_LAT       = 0.368
-FA_TFLOP     = 35.04
+CUDNN_LAT    = 0.892
+CUDNN_TFLOP  = 14.45
+FI_LAT       = 1.082
+FI_TFLOP     = 11.91
+FA_LAT       = 0.403
+FA_TFLOP     = 31.96
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 fig.suptitle('Sparse Mask Attention — Optimization Progress (B=16, N=512, H=12, D=64, FP16, sparsity=0.75)',
@@ -89,7 +90,7 @@ ax.grid(axis='y', alpha=0.4, zorder=1)
 leg_patches = [
     mpatches.Patch(color='#4C72B0', label='Scalar optimization (R0-R8)'),
     mpatches.Patch(color='#DD8452', label='WMMA QK^T (R9-R12)'),
-    mpatches.Patch(color='#55A868', label='WMMA QK+PV (R14-R19)'),
+    mpatches.Patch(color='#55A868', label='WMMA QK+PV (R14-R23)'),
 ]
 ax.legend(handles=leg_patches + ax.get_legend_handles_labels()[0][::-1],
           fontsize=7, loc='upper right')
