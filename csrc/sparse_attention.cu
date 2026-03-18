@@ -1,30 +1,32 @@
 /*
  * Sparse Mask Attention - CUDA Kernel
  *
- * Round 23: Register-resident softmax — eliminate smem_max/sum/rsc,
- *   do softmax entirely in registers using WMMA fragment layout.
- *   (builds on Round 22: merged sc/pv arrays)
+ * Round 25: PTX mma PV — eliminate smem_p by packing softmax output
+ *   directly from WMMA accumulator registers into PTX mma A operand.
+ *   V loaded manually from smem into PTX mma B operand (col-major).
+ *   (builds on Round 23: register-resident softmax)
  *
- * Key change: Exploit WMMA accumulator layout (row = lane/4, 4 lanes/row)
- *   to do softmax via __shfl_xor_sync(mask, val, 1/2) cross-lane reduction.
- *   - Eliminates QK→smem_p write + softmax smem_p read (50% less smem_p traffic)
- *   - Eliminates smem_max/smem_sum/smem_rsc (all register-resident)
- *   - Removes 1 __syncwarp barrier per iteration
- *   - Per-iteration savings: ~96 smem load/store + 1 barrier
+ * Key changes vs Round 23:
+ *   - smem_p eliminated: P stays in registers (WMMA acc → f2h2 → PTX mma A)
+ *   - PV uses mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+ *   - V manually loaded from smem_v in col-major B operand layout
+ *   - __syncwarp between softmax and PV eliminated
+ *   - smem drops from ~37KB to ~28KB → potential 3 blocks/SM (was 2)
+ *   - Result: 0.465ms → 92.9% MFU (was 0.512ms / 84.4%)
  *
- * WMMA accumulator element layout (m16n16k16, float, row_major):
- *   frag.x[i], lane L:
- *     row = L/4 + ((i & 2) ? 8 : 0)
- *     col offsets: {0,1,0,1,8,9,8,9}[i] + (L%4)*2
+ * PTX mma A operand layout (m16k16, .row) verified on sm_86:
+ *   a[0]=pack(x[0],x[1]) row0-7/k0-7, a[1]=pack(x[2],x[3]) row8-15/k0-7,
+ *   a[2]=pack(x[4],x[5]) row0-7/k8-15, a[3]=pack(x[6],x[7]) row8-15/k8-15
+ * PTX mma B operand layout (k16n8, .col):
+ *   n=lane/4, k_base=(lane%4)*2; b[0]={V[k_base][n], V[k_base+1][n]}
  *
  * Shared memory per block:
- *   smem_q[4][16][72]    fp16  =  9216 B  (HD+8 padding)
- *   smem_k[64][72]       fp16  =  9216 B  (HD+8 padding)
- *   smem_v[64][72]       fp16  =  9216 B  (HD+8 padding)
- *   smem_p[4][16][72]    fp16  =  9216 B  (BN+8 padding)
+ *   smem_q[4][16][72]    fp16  =  9216 B
+ *   smem_k[64][72]       fp16  =  9216 B
+ *   smem_v[64][72]       fp16  =  9216 B
  *   smem_mask[64][2]     u32   =   512 B
  *   warp_ballots[4]      u32   =    16 B
- *   Total ≈ 36.7 KB
+ *   Total ≈ 28.2 KB
  */
 
 #include "sparse_attention.h"
@@ -59,6 +61,17 @@ __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" : : "n"(N));
 }
 
+// Pack two float values into a uint32 as two fp16 (low=a, high=b)
+__device__ __forceinline__ uint32_t f2h2(float a, float b) {
+    uint32_t res;
+    asm("{.reg .f16 ha, hb;\n"
+        " cvt.rn.f16.f32 ha, %1;\n"
+        " cvt.rn.f16.f32 hb, %2;\n"
+        " mov.b32 %0, {ha, hb};}\n"
+        : "=r"(res) : "f"(a), "f"(b));
+    return res;
+}
+
 // WMMA accumulator m16n16k16 float element layout (row_major, verified on sm_86):
 //   frag.x[i], lane L:
 //     row = L/4 + ((i & 2) ? 8 : 0)   [i in {2,3,6,7} → +8]
@@ -84,7 +97,7 @@ __global__ void sparse_attn_wmma_full_fp16(
     constexpr int HD     = 64;
     constexpr int WK     = 16;
     constexpr int NQK    = BN / WK;  // = 4 WMMA tiles for QK^T (BM×WK × WK×BN)
-    constexpr int NF     = HD / WK;  // = 4 output column fragments per row (PV)
+    constexpr int NF_N8  = HD / 8;   // = 8 output groups of 8 cols (PTX mma m16n8)
     constexpr int NWARPS = 4;
     constexpr int BROWS  = BM * NWARPS;  // = 64
     constexpr int NTH    = 32 * NWARPS;  // = 128
@@ -117,7 +130,6 @@ __global__ void sparse_attn_wmma_full_fp16(
     __shared__ __align__(16) __half smem_q[NWARPS][BM][HD + PP];     // Q tiles (padded)
     __shared__ __align__(16) __half smem_k[BN][HD + PP];             // K single-buffer (padded)
     __shared__ __align__(16) __half smem_v[BN][HD + PP];             // V single-buffer (padded)
-    __shared__ __align__(16) __half smem_p[NWARPS][BM][BN + PP];    // scores P (padded)
     __shared__ uint32_t  warp_ballots[NWARPS];
     __shared__ uint32_t  smem_mask[BROWS][2];  // mask bits for current tile: [row][word0/word1]
 
@@ -134,11 +146,15 @@ __global__ void sparse_attn_wmma_full_fp16(
     float old_max_a = -65504.f, old_max_b = -65504.f;
     float old_sum_a = 0.f, old_sum_b = 0.f;
 
-    // ---- Per-warp accumulator fragments ----
-    // NF=4 fragments, each m16n16k16, covering output cols [f*16..(f+1)*16-1]
-    wmma::fragment<wmma::accumulator, BM, WK, WK, float> acc_frag[NF];
+    // ---- Per-warp accumulator (PTX mma m16n8k16 layout) ----
+    // acc[nn][j]: nn=output col group (8 groups of 8), j=element (4 per thread)
+    //   j=0: row=groupID,   col=nn*8+(lane%4)*2
+    //   j=1: row=groupID,   col=nn*8+(lane%4)*2+1
+    //   j=2: row=groupID+8, col=nn*8+(lane%4)*2
+    //   j=3: row=groupID+8, col=nn*8+(lane%4)*2+1
+    float acc[NF_N8][4];
 #pragma unroll
-    for (int f = 0; f < NF; f++) wmma::fill_fragment(acc_frag[f], 0.f);
+    for (int nn = 0; nn < NF_N8; nn++) { acc[nn][0] = acc[nn][1] = acc[nn][2] = acc[nn][3] = 0.f; }
 
     const int lrow = lane % BM;
     const int grow = wr + lrow;
@@ -289,13 +305,11 @@ __global__ void sparse_attn_wmma_full_fp16(
             float rsc_a = (old_max_a > -65000.f) ? expf(old_max_a - nm_a) : 1.f;
             float rsc_b = (old_max_b > -65000.f) ? expf(old_max_b - nm_b) : 1.f;
 
-            // ---- Rescale acc_frag before accumulating new tile ----
+            // ---- Rescale acc before accumulating new tile ----
 #pragma unroll
-            for (int f = 0; f < NF; f++) {
-#pragma unroll
-                for (int i = 0; i < 8; i++) {
-                    acc_frag[f].x[i] *= ((i & 2) ? rsc_b : rsc_a);
-                }
+            for (int nn = 0; nn < NF_N8; nn++) {
+                acc[nn][0] *= rsc_a; acc[nn][1] *= rsc_a;
+                acc[nn][2] *= rsc_b; acc[nn][3] *= rsc_b;
             }
 
             // ---- exp + local sum ----
@@ -326,56 +340,69 @@ __global__ void sparse_attn_wmma_full_fp16(
             old_max_a = nm_a;
             old_max_b = nm_b;
 
-            // ---- Write post-softmax P to smem_p for PV WMMA ----
+            // ---- PTX mma PV: Pack P from WMMA acc → mma A operand, load V → mma B operand ----
+            // Verified A operand layout for m16n8k16 .row:
+            //   a[0] = pack(x[0],x[1])  row 0-7,  k 0-7
+            //   a[1] = pack(x[2],x[3])  row 8-15, k 0-7
+            //   a[2] = pack(x[4],x[5])  row 0-7,  k 8-15
+            //   a[3] = pack(x[6],x[7])  row 8-15, k 8-15
+            // Verified B operand layout for m16n8k16 .col:
+            //   n=lane/4 (0..7), k_base=(lane%4)*2 (0,2,4,6)
+            //   b[0] = {V[k_base][n], V[k_base+1][n]}    k 0-7
+            //   b[1] = {V[k_base+8][n], V[k_base+9][n]}  k 8-15
+            const int b_n    = lane / 4;         // B n-column: 0..7
+            const int b_koff = (lane % 4) * 2;   // B k-row base: 0,2,4,6
 #pragma unroll
-            for (int f = 0; f < NQK; f++) {
-#pragma unroll
-                for (int i = 0; i < 8; i++) {
-                    int fr = lane / 4 + ((i & 2) ? 8 : 0);
-                    int fc = f * WK + (lane % 4) * 2 + wmma_col_off[i];
-                    smem_p[wid][fr][fc] = __float2half(qk_sub[f].x[i]);
-                }
-            }
-        }
-        __syncwarp();
+            for (int kk = 0; kk < NQK; kk++) {
+                uint32_t pa[4];
+                pa[0] = f2h2(qk_sub[kk].x[0], qk_sub[kk].x[1]);
+                pa[1] = f2h2(qk_sub[kk].x[2], qk_sub[kk].x[3]);
+                pa[2] = f2h2(qk_sub[kk].x[4], qk_sub[kk].x[5]);
+                pa[3] = f2h2(qk_sub[kk].x[6], qk_sub[kk].x[7]);
 
-        // ---- WMMA PV: P[BM×BN=64] × V[BN=64×HD=64] → acc_frag[NF] ----
-        if (wr < seq_len) {
 #pragma unroll
-            for (int f = 0; f < NF; f++) {
-#pragma unroll
-                for (int k = 0; k < NQK; k++) {
-                    wmma::fragment<wmma::matrix_a, BM, WK, WK, __half, wmma::row_major> pa;
-                    wmma::fragment<wmma::matrix_b, WK, WK, WK, __half, wmma::row_major> vb;
-                    wmma::load_matrix_sync(pa, &smem_p[wid][0][k * WK], BN + PP);
-                    wmma::load_matrix_sync(vb, &smem_v[k * WK][f * WK], HD + PP);
-                    wmma::mma_sync(acc_frag[f], pa, vb, acc_frag[f]);
+                for (int nn = 0; nn < NF_N8; nn++) {
+                    int nc = nn * 8 + b_n;
+                    int k0 = kk * WK + b_koff;
+                    uint32_t vb0 = f2h2(__half2float(smem_v[k0    ][nc]),
+                                        __half2float(smem_v[k0 + 1][nc]));
+                    uint32_t vb1 = f2h2(__half2float(smem_v[k0 + 8][nc]),
+                                        __half2float(smem_v[k0 + 9][nc]));
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0, %1, %2, %3}, "
+                        "{%4, %5, %6, %7}, "
+                        "{%8, %9}, "
+                        "{%0, %1, %2, %3};\n"
+                        : "+f"(acc[nn][0]), "+f"(acc[nn][1]),
+                          "+f"(acc[nn][2]), "+f"(acc[nn][3])
+                        : "r"(pa[0]), "r"(pa[1]), "r"(pa[2]), "r"(pa[3]),
+                          "r"(vb0), "r"(vb1)
+                    );
                 }
             }
         }
     }
 
-    // ---- Normalize and write output directly from fragment elements ----
+    // ---- Normalize and write output from PTX mma accumulator ----
     if (wr < seq_len) {
 #pragma unroll
-        for (int f = 0; f < NF; f++) {
+        for (int nn = 0; nn < NF_N8; nn++) {
 #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                int fr   = lane / 4 + ((i & 2) ? 8 : 0);
-                int fc   = (lane % 4) * 2 + wmma_col_off[i];
-                int gr2  = wr + fr;
-                int gc2  = f * WK + fc;
+            for (int j = 0; j < 4; j++) {
+                int fr  = lane / 4 + ((j >= 2) ? 8 : 0);
+                int fc  = nn * 8 + (lane % 4) * 2 + (j & 1);
+                int gr2 = wr + fr;
                 if (gr2 < seq_len) {
-                    float s = ((i & 2) ? old_sum_b : old_sum_a);
-                    float out_val = (s > 0.f) ? (acc_frag[f].x[i] / s) : 0.f;
-                    Obh[gr2 * HD + gc2] = __float2half(out_val);
+                    float s = ((j >= 2) ? old_sum_b : old_sum_a);
+                    float out_val = (s > 0.f) ? (acc[nn][j] / s) : 0.f;
+                    Obh[gr2 * HD + fc] = __float2half(out_val);
                 }
-                if (save_lse && LSE && f == 0 && (i == 0 || i == 2)) {
-                    int fc_lse = (lane % 4) * 2 + wmma_col_off[i];
-                    if (fc_lse == 0 && gr2 < seq_len) {
+                if (save_lse && LSE && nn == 0 && (j == 0 || j == 2)) {
+                    if ((lane % 4) == 0 && gr2 < seq_len) {
                         int li = (batch_id * num_heads + head_id) * seq_len + gr2;
-                        float m = ((i & 2) ? old_max_b : old_max_a);
-                        float s = ((i & 2) ? old_sum_b : old_sum_a);
+                        float m = ((j >= 2) ? old_max_b : old_max_a);
+                        float s = ((j >= 2) ? old_sum_b : old_sum_a);
                         LSE[li] = m + logf(fmaxf(s, 1e-30f));
                     }
                 }

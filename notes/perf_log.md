@@ -629,3 +629,39 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 - 结果: 持平，当前已约 2 blocks/SM，无实质影响
 
 结论: 当前 kernel 在现有架构下已接近局部最优，需更大改动（如 PTX MMA、不同 tile 策略）才有突破
+
+### Round 25 — PTX mma PV: 消除 smem_p, register-resident P×V
+
+改动:
+- PV 乘法从 WMMA mma_sync 改为 PTX `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`
+- softmax 后的 P 矩阵直接从 WMMA accumulator 寄存器打包为 PTX mma A 操作数，不再写入 smem_p
+- V 从 smem_v 手动加载为 PTX mma B 操作数 (col-major 布局)
+- smem_p[4][16][72] 完全消除，节省 ~9.2KB 共享内存
+- 共享内存从 ~37KB 降至 ~28KB，理论上可达 3 blocks/SM (原 2 blocks/SM)
+- 消除了 softmax 与 PV 之间的 __syncwarp
+
+PTX mma 寄存器布局 (实测验证, sm_86):
+- A 操作数 (row-major m16k16): a[0]=pack(x[0],x[1]) row0-7/k0-7, **a[1]=pack(x[2],x[3]) row8-15/k0-7**, **a[2]=pack(x[4],x[5]) row0-7/k8-15**, a[3]=pack(x[6],x[7]) row8-15/k8-15
+  - 注: a[1]/a[2] 与常见文档描述相反 (a[1]对应rows 8-15而非k 8-15)
+- B 操作数 (col-major k16n8): n=lane/4, k_base=(lane%4)*2; 打包同列相邻k行
+- D 输出: d[0]=O[lane/4][(lane%4)*2], d[1]=O[lane/4][(lane%4)*2+1], d[2]=O[lane/4+8][...], d[3]=O[lane/4+8][...]
+
+| N | latency(ms) | TFLOPS | MFU% |
+|---|---|---|---|
+| 64 | 0.030 | 6.62 | 22.2% |
+| 128 | 0.059 | 13.61 | 45.7% |
+| 256 | 0.154 | 20.98 | 70.4% |
+| 512 | 0.495 | 26.01 | 87.3% |
+| 1024 | 1.822 | 28.28 | 94.9% |
+
+横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
+- Ours: 0.465 ms (27.70 TFLOPS)
+- Triton: 0.752 ms (17.14 TFLOPS)
+- cuDNN SDPA: 0.892 ms (14.45 TFLOPS)
+- FlashInfer: 1.081 ms (11.92 TFLOPS)
+- PyTorch Ref: 2.090 ms (6.17 TFLOPS)
+- flash-attn (dense): 0.403 ms (32.01 TFLOPS)
+- 加速比 vs Ref: 4.49x；vs Triton: 1.62x
+
+关键指标 (N=512): **0.465 ms, 27.70 TFLOPS, 92.9% MFU** (vs Round 23: 0.512ms, 提速 1.10x)
+Peak MFU (B=64, N=512): **97.2%**
