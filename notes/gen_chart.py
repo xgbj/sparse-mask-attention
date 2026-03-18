@@ -28,6 +28,7 @@ rounds = [
     (21, "R21 2-lane sfmx",  0.583, 22.12),
     (22, "R22 merge sc/pv",  0.571, 22.58),
     (23, "R23 reg softmax",  0.512, 25.17),
+    (25, "R25 PTX mma PV",   0.466, 27.66),
 ]
 
 r_ids   = [r[0]  for r in rounds]
@@ -41,11 +42,11 @@ TRITON_TFLOP = 17.15
 PT_REF_LAT   = 2.091
 PT_REF_TFLOP = 6.16
 CUDNN_LAT    = 0.892
-CUDNN_TFLOP  = 14.45
-FI_LAT       = 1.082
-FI_TFLOP     = 11.91
+CUDNN_TFLOP  = 14.44
+FI_LAT       = 1.086
+FI_TFLOP     = 11.86
 FA_LAT       = 0.403
-FA_TFLOP     = 31.96
+FA_TFLOP     = 31.98
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 fig.suptitle('Sparse Mask Attention — Optimization Progress (B=16, N=512, H=12, D=64, FP16, sparsity=0.75)',
@@ -90,7 +91,7 @@ ax.grid(axis='y', alpha=0.4, zorder=1)
 leg_patches = [
     mpatches.Patch(color='#4C72B0', label='Scalar optimization (R0-R8)'),
     mpatches.Patch(color='#DD8452', label='WMMA QK^T (R9-R12)'),
-    mpatches.Patch(color='#55A868', label='WMMA QK+PV (R14-R23)'),
+    mpatches.Patch(color='#55A868', label='WMMA QK+PV (R14-R25)'),
 ]
 ax.legend(handles=leg_patches + ax.get_legend_handles_labels()[0][::-1],
           fontsize=7, loc='upper right')

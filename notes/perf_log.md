@@ -8,6 +8,8 @@ GPU: NVIDIA GeForce RTX 3080 (sm_86)
 - 正确性: B=2, H=4, D=64, N=[64,128,256,512], sparsity=0.75, tol=1e-2
 - 性能: B=16, H=12, D=64, N=512, sparsity=0.75
 - 对比延迟: B=16, N=512, H=12, D=64
+- MFU 峰值: RTX 3080 FP16 Tensor Core = 59.5 TFLOPS（Round 19 起 kernel 使用 WMMA/PTX mma Tensor Core）
+- 注: Round 10-18 的 MFU% 曾以 CUDA Core 29.8T 为分母，数值偏高，TFLOPS 列不受影响
 
 ## 优化记录
 
@@ -289,41 +291,44 @@ GPU: NVIDIA GeForce RTX 3080 (sm_86)
 
 ## 总结
 
-| Round | 改动 | N=512 延迟 | TFLOPS | vs PyTorch Ref | vs Triton |
-|---|---|---|---|---|---|
-| 0 | Baseline | 16.571 ms | 12.16 | 0.3x (BF16) | — |
-| 1 | maxreg 128 | 6.575 ms | 1.96 | 0.7x | — |
-| 2 | 128 threads | 5.113 ms | 2.52 | 0.9x | — |
-| 3 | batch mask | 4.962 ms | 2.60 | 0.9x | — |
-| 4 | KV co-load | 4.231 ms | 12.16 | 1.1x | — |
-| 5 | float4+no pad | 4.008 ms | 3.20 | 1.2x | — |
-| 6 | no maxreg | 3.869 ms | 3.32 | 1.2x | — |
-| 7 | BLOCK_N=16 | 3.453 ms | 3.72 | 1.4x | — |
-| 8 | merge mask | 3.247 ms | 3.96 | 1.4x | — |
-| 9 | FP16+detect | 3.673 ms | 3.52 | 0.64x (FP16 TC) | — |
-| 10 | WMMA 1-warp | 2.483 ms | 5.20 | 0.95x | — |
-| 11 | WMMA 4-warp | 1.890 ms | 6.80 | 1.12x | — |
-| 12 | smem_v float | 1.763 ms | 7.32 | 1.18x | 0.43x |
-| 14 | WMMA PV全化 | 1.046 ms | 12.32 | 2.00x | 0.72x |
-| 15 | cp.async+smem_p pad | 1.052 ms | 12.24 | 2.27x | 0.82x |
-| 16 | NWARPS 4→8（失败） | 1.129 ms | 11.40 | 2.11x | 0.76x |
-| 17 | cp.async 真双缓冲（持平） | 1.064 ms | 12.12 | 2.24x | 0.80x |
-| 18 | BN 16→64（大 tile）| 0.938 ms | 13.72 | 2.53x | 0.91x |
-| 19 | smem Q/K/V pad+8 | 0.622 ms | 20.73 | 3.67x | 1.38x ★ |
-| 20 | mask预读smem | 0.595 ms | 21.64 | 3.84x | 1.38x |
-| 21 | 2-lane并行softmax | 0.583 ms | 22.12 | 3.92x | 1.41x |
-| 22 | 合并sc/pv数组 | 0.571 ms | 22.58 | 4.02x | 1.44x |
-| 23 | 寄存器内softmax | 0.512 ms | 25.17 | 4.42x | 1.59x |
+| Round | 改动 | N=512 延迟 | TFLOPS | MFU% | vs PyTorch Ref | vs Triton |
+|---|---|---|---|---|---|---|
+| 0 | Baseline | 16.571 ms | 0.78 | — | 0.3x (BF16) | — |
+| 1 | maxreg 128 | 6.575 ms | 1.96 | — | 0.7x | — |
+| 2 | 128 threads | 5.113 ms | 2.52 | — | 0.9x | — |
+| 3 | batch mask | 4.962 ms | 2.60 | — | 0.9x | — |
+| 4 | KV co-load | 4.231 ms | 3.04 | — | 1.1x | — |
+| 5 | float4+no pad | 4.008 ms | 3.20 | — | 1.2x | — |
+| 6 | no maxreg | 3.869 ms | 3.32 | — | 1.2x | — |
+| 7 | BLOCK_N=16 | 3.453 ms | 3.72 | — | 1.4x | — |
+| 8 | merge mask | 3.247 ms | 3.96 | — | 1.4x | — |
+| 9 | FP16+detect | 3.673 ms | 3.52 | — | 0.64x (FP16 TC) | — |
+| 10 | WMMA 1-warp | 2.483 ms | 5.20 | 8.7% | 0.95x | — |
+| 11 | WMMA 4-warp | 1.890 ms | 6.80 | 11.4% | 1.12x | — |
+| 12 | smem_v float | 1.763 ms | 7.32 | 12.3% | 1.18x | 0.43x |
+| 14 | WMMA PV全化 | 1.046 ms | 12.32 | 20.7% | 2.00x | 0.72x |
+| 15 | cp.async+smem_p pad | 1.052 ms | 12.24 | 20.6% | 2.27x | 0.82x |
+| 16 | NWARPS 4→8（失败） | 1.129 ms | 11.40 | 19.2% | 2.11x | 0.76x |
+| 17 | cp.async 真双缓冲（持平） | 1.064 ms | 12.12 | 20.4% | 2.24x | 0.80x |
+| 18 | BN 16→64（大 tile）| 0.938 ms | 13.72 | 23.1% | 2.53x | 0.91x |
+| 19 | smem Q/K/V pad+8 | 0.622 ms | 20.73 | 34.8% | 3.67x | 1.38x ★ |
+| 20 | mask预读smem | 0.595 ms | 21.64 | 36.4% | 3.84x | 1.38x |
+| 21 | 2-lane并行softmax | 0.583 ms | 22.12 | 37.2% | 3.92x | 1.41x |
+| 22 | 合并sc/pv数组 | 0.571 ms | 22.58 | 37.9% | 4.02x | 1.44x |
+| 23 | 寄存器内softmax | 0.512 ms | 25.17 | 42.3% | 4.42x | 1.59x |
+| 25 | PTX mma PV | 0.466 ms | 27.66 | 46.5% | 4.49x | 1.61x |
+
+MFU% = TFLOPS / 59.5 (FP16 Tensor Core peak)，Round 0-9 为标量 kernel 不适用。
 
 Baselines (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - **PyTorch Ref (FP16 TC):** 2.091 ms, 6.16 TFLOPS
 - **Triton (FP16 TC):** 0.751 ms, 17.15 TFLOPS ← 已超越
-- **cuDNN SDPA:** 0.892 ms, 14.45 TFLOPS ← 已超越
-- **FlashInfer:** 1.082 ms, 11.91 TFLOPS ← 已超越
-- **flash-attn (dense, 无mask):** 0.403 ms, 31.96 TFLOPS ← 当前目标
+- **cuDNN SDPA:** 0.892 ms, 14.44 TFLOPS ← 已超越
+- **FlashInfer:** 1.086 ms, 11.86 TFLOPS ← 已超越
+- **flash-attn (dense, 无mask):** 0.403 ms, 31.98 TFLOPS ← 当前目标
 
-总提速: 16.571ms → 0.512ms = **32.4x** (Baseline → Round 23)
-当前状态: 已超越 Triton 1.59x，距 flash-attn (dense) 还差 1.17x
+总提速: 16.571ms → 0.466ms = **35.6x** (Baseline → Round 25)
+当前状态: 已超越 Triton 1.61x，距 flash-attn (dense) 还差 1.16x
 
 ### Round 13 — WMMA PV 累加（失败，已回滚）
 
@@ -455,13 +460,13 @@ smem_k/v 贡献 ~84% 冲突，smem_q ~10%，全部 padding 后效果显著。
 smem 增量: Q +4×16×8×2=1024B, K +64×8×2=1024B, V +64×8×2=1024B, 总 +3KB（34→37KB）
 
 序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
-| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+| N | latency(ms) | TFLOPS | MFU%(vs 59.5T) |
 |---|---|---|---|
-| 64 | 0.035 | 5.81 | 19.5% |
-| 128 | 0.067 | 12.03 | 40.4% |
-| 256 | 0.185 | 17.37 | 58.3% |
-| 512 | 0.622 | 20.73 | 69.6% |
-| 1024 | 2.229 | 23.12 | 77.6% |
+| 64 | 0.035 | 5.81 | 9.8% |
+| 128 | 0.067 | 12.03 | 20.2% |
+| 256 | 0.185 | 17.37 | 29.2% |
+| 512 | 0.622 | 20.73 | 34.8% |
+| 1024 | 2.229 | 23.12 | 38.9% |
 
 横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - Ours: 0.574 ms (22.46 TFLOPS)  ← Baseline 对比单点
@@ -472,7 +477,7 @@ smem 增量: Q +4×16×8×2=1024B, K +64×8×2=1024B, V +64×8×2=1024B, 总 +3K
 - flash-attn (dense): 0.368 ms (35.04 TFLOPS)
 - 加速比 vs Ref: 3.67x；vs Triton: 1.38x ★ 首次超越 Triton
 
-关键指标 (N=512): **0.622 ms, 20.73 TFLOPS** (vs Round 18: 0.938ms, 提速 1.51x)
+关键指标 (N=512): **0.622 ms, 20.73 TFLOPS, 34.8% MFU** (vs Round 18: 0.938ms, 提速 1.51x)
 
 ### Round 20 — mask 预读到 smem，消除逐元素全局内存读取
 
@@ -494,13 +499,13 @@ ncu 对比 R19→R20:
 - TC utilization: 22.5% → 23.8% (+5%)
 
 序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
-| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+| N | latency(ms) | TFLOPS | MFU%(vs 59.5T) |
 |---|---|---|---|
-| 64 | 0.034 | 5.96 | 20.0% |
-| 128 | 0.065 | 12.35 | 41.5% |
-| 256 | 0.180 | 17.86 | 59.9% |
-| 512 | 0.595 | 21.64 | 72.6% |
-| 1024 | 2.174 | 23.70 | 79.5% |
+| 64 | 0.034 | 5.96 | 10.0% |
+| 128 | 0.065 | 12.35 | 20.8% |
+| 256 | 0.180 | 17.86 | 30.0% |
+| 512 | 0.595 | 21.64 | 36.4% |
+| 1024 | 2.174 | 23.70 | 39.8% |
 
 横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - Ours: 0.544 ms (23.69 TFLOPS)
@@ -511,7 +516,7 @@ ncu 对比 R19→R20:
 - flash-attn (dense): 0.403 ms (31.96 TFLOPS)
 - 加速比 vs Ref: 3.84x；vs Triton: 1.38x
 
-关键指标 (N=512): **0.595 ms, 21.64 TFLOPS** (vs Round 19: 0.622ms, 提速 1.05x)
+关键指标 (N=512): **0.595 ms, 21.64 TFLOPS, 36.4% MFU** (vs Round 19: 0.622ms, 提速 1.05x)
 
 ### Round 21 — 2-lane 并行 softmax（每行 2 lanes 协作）
 
@@ -527,13 +532,13 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 2-lane 并行将每 lane 的 expf 调用从 64 次减半到 32 次。
 
 序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
-| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+| N | latency(ms) | TFLOPS | MFU%(vs 59.5T) |
 |---|---|---|---|
-| 64 | 0.033 | 6.05 | 20.3% |
-| 128 | 0.065 | 12.40 | 41.6% |
-| 256 | 0.177 | 18.23 | 61.2% |
-| 512 | 0.583 | 22.12 | 74.2% |
-| 1024 | 2.008 | 25.67 | 86.1% |
+| 64 | 0.033 | 6.05 | 10.2% |
+| 128 | 0.065 | 12.40 | 20.8% |
+| 256 | 0.177 | 18.23 | 30.6% |
+| 512 | 0.583 | 22.12 | 37.2% |
+| 1024 | 2.008 | 25.67 | 43.1% |
 
 横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - Ours: 0.533 ms (24.18 TFLOPS)
@@ -544,7 +549,7 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 - flash-attn (dense): 0.403 ms (31.98 TFLOPS)
 - 加速比 vs Ref: 3.92x；vs Triton: 1.41x
 
-关键指标 (N=512): **0.583 ms, 22.12 TFLOPS** (vs Round 20: 0.595ms, 提速 1.02x)
+关键指标 (N=512): **0.583 ms, 22.12 TFLOPS, 37.2% MFU** (vs Round 20: 0.595ms, 提速 1.02x)
 
 ### Round 22 — 合并 softmax sc/pv 数组，减少寄存器压力
 
@@ -558,13 +563,13 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 注: __launch_bounds__(128,3) 尝试失败（强制压缩寄存器导致正确性错误）。
 
 序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
-| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+| N | latency(ms) | TFLOPS | MFU%(vs 59.5T) |
 |---|---|---|---|
-| 64 | 0.033 | 6.10 | 20.5% |
-| 128 | 0.065 | 12.34 | 41.4% |
-| 256 | 0.175 | 18.41 | 61.8% |
-| 512 | 0.571 | 22.58 | 75.8% |
-| 1024 | 2.020 | 25.51 | 85.6% |
+| 64 | 0.033 | 6.10 | 10.3% |
+| 128 | 0.065 | 12.34 | 20.7% |
+| 256 | 0.175 | 18.41 | 30.9% |
+| 512 | 0.571 | 22.58 | 37.9% |
+| 1024 | 2.020 | 25.51 | 42.9% |
 
 横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - Ours: 0.520 ms (24.79 TFLOPS)
@@ -575,7 +580,7 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 - flash-attn (dense): 0.402 ms (32.02 TFLOPS)
 - 加速比 vs Ref: 4.02x；vs Triton: 1.44x
 
-关键指标 (N=512): **0.571 ms, 22.58 TFLOPS** (vs Round 21: 0.583ms, 提速 1.02x)
+关键指标 (N=512): **0.571 ms, 22.58 TFLOPS, 37.9% MFU** (vs Round 21: 0.583ms, 提速 1.02x)
 
 ### Round 23 — 寄存器内 softmax（Register-resident softmax）
 
@@ -595,13 +600,13 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 通过在寄存器中完成 softmax，消除初始 QK→smem_p 写+读 round-trip，减少 ~96 smem load/store/迭代。
 
 序列长度缩放 (B=16, H=12, D=64, sparsity=0.75):
-| N | latency(ms) | TFLOPS | MFU%(vs 29.8T) |
+| N | latency(ms) | TFLOPS | MFU%(vs 59.5T) |
 |---|---|---|---|
-| 64 | 0.031 | 6.50 | 21.8% |
-| 128 | 0.061 | 13.24 | 44.4% |
-| 256 | 0.159 | 20.31 | 68.2% |
-| 512 | 0.512 | 25.17 | 84.4% |
-| 1024 | 1.854 | 27.80 | 93.3% |
+| 64 | 0.031 | 6.50 | 10.9% |
+| 128 | 0.061 | 13.24 | 22.3% |
+| 256 | 0.159 | 20.31 | 34.1% |
+| 512 | 0.512 | 25.17 | 42.3% |
+| 1024 | 1.854 | 27.80 | 46.7% |
 
 横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
 - Ours: 0.473 ms (27.22 TFLOPS)
@@ -612,7 +617,7 @@ softmax 的 expf 展开产生大量 FMA 指令，是 FMA pipe 饱和的主因。
 - flash-attn (dense): 0.403 ms (31.96 TFLOPS)
 - 加速比 vs Ref: 4.42x；vs Triton: 1.59x
 
-关键指标 (N=512): **0.512 ms, 25.17 TFLOPS** (vs Round 22: 0.571ms, 提速 1.12x)
+关键指标 (N=512): **0.512 ms, 25.17 TFLOPS, 42.3% MFU** (vs Round 22: 0.571ms, 提速 1.12x)
 
 ### Round 24 — 多轮尝试均无有效进展（已回滚）
 
@@ -646,22 +651,32 @@ PTX mma 寄存器布局 (实测验证, sm_86):
 - B 操作数 (col-major k16n8): n=lane/4, k_base=(lane%4)*2; 打包同列相邻k行
 - D 输出: d[0]=O[lane/4][(lane%4)*2], d[1]=O[lane/4][(lane%4)*2+1], d[2]=O[lane/4+8][...], d[3]=O[lane/4+8][...]
 
-| N | latency(ms) | TFLOPS | MFU% |
+| N | latency(ms) | TFLOPS | MFU%(vs 59.5T) |
 |---|---|---|---|
-| 64 | 0.030 | 6.62 | 22.2% |
-| 128 | 0.059 | 13.61 | 45.7% |
-| 256 | 0.154 | 20.98 | 70.4% |
-| 512 | 0.495 | 26.01 | 87.3% |
-| 1024 | 1.822 | 28.28 | 94.9% |
+| 64 | 0.030 | 6.65 | 11.2% |
+| 128 | 0.059 | 13.56 | 22.8% |
+| 256 | 0.153 | 21.02 | 35.3% |
+| 512 | 0.496 | 26.00 | 43.7% |
+| 1024 | 1.822 | 28.28 | 47.5% |
+
+Batch size 缩放 (N=512, H=12, D=64, sparsity=0.75):
+| B | latency(ms) | TFLOPS | MFU% |
+|---|---|---|---|
+| 1 | 0.051 | 15.86 | 26.6% |
+| 4 | 0.139 | 23.21 | 39.0% |
+| 8 | 0.261 | 24.69 | 41.5% |
+| 16 | 0.459 | 28.05 | 47.1% |
+| 32 | 0.890 | 28.96 | 48.7% |
+| 64 | 1.779 | 28.96 | 48.7% |
 
 横向对比 (B=16, N=512, H=12, D=64, FP16, sparsity=0.75):
-- Ours: 0.465 ms (27.70 TFLOPS)
-- Triton: 0.752 ms (17.14 TFLOPS)
-- cuDNN SDPA: 0.892 ms (14.45 TFLOPS)
-- FlashInfer: 1.081 ms (11.92 TFLOPS)
-- PyTorch Ref: 2.090 ms (6.17 TFLOPS)
-- flash-attn (dense): 0.403 ms (32.01 TFLOPS)
-- 加速比 vs Ref: 4.49x；vs Triton: 1.62x
+- Ours: 0.466 ms (27.66 TFLOPS)
+- Triton: 0.751 ms (17.15 TFLOPS)
+- cuDNN SDPA: 0.892 ms (14.44 TFLOPS)
+- FlashInfer: 1.086 ms (11.86 TFLOPS)
+- PyTorch Ref: 2.091 ms (6.16 TFLOPS)
+- flash-attn (dense): 0.403 ms (31.98 TFLOPS)
+- 加速比 vs Ref: 4.49x；vs Triton: 1.61x
 
-关键指标 (N=512): **0.465 ms, 27.70 TFLOPS, 92.9% MFU** (vs Round 23: 0.512ms, 提速 1.10x)
-Peak MFU (B=64, N=512): **97.2%**
+关键指标 (N=512): **0.466 ms, 27.66 TFLOPS, 46.5% MFU** (vs Round 23: 0.512ms, 提速 1.10x)
+Peak MFU (B=64, N=512): **48.7%**

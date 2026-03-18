@@ -184,15 +184,14 @@ def measure_latency(fn, warmup=10, repeat=50):
 
 
 def get_peak_tflops(dtype):
-    """根据 dtype 返回当前 GPU 的峰值 TFLOPS"""
+    """根据 dtype 返回当前 GPU 的峰值 TFLOPS (Tensor Core for FP16/BF16)"""
     if dtype in (torch.float16, torch.bfloat16):
-        # 我们的 kernel 没用 Tensor Core，用 CUDA Core 峰值
-        return GPU_INFO["fp16_cuda_tflops"]
+        return GPU_INFO["fp16_tc_tflops"]
     return GPU_INFO["fp32_tflops"]
 
 
 def get_peak_tflops_tc():
-    """Tensor Core 峰值（用于 PyTorch Ref 的 MFU 计算）"""
+    """Tensor Core 峰值"""
     return GPU_INFO["fp16_tc_tflops"]
 
 
@@ -419,8 +418,7 @@ def run_perf():
     peak = get_peak_tflops(dtype)
     peak_tc = get_peak_tflops_tc()
 
-    print(f"  Kernel 峰值参考: {peak:.1f} TFLOPS (FP16 CUDA Core)")
-    print(f"  PyTorch Ref 峰值参考: {peak_tc:.1f} TFLOPS (FP16 Tensor Core)")
+    print(f"  峰值参考: {peak:.1f} TFLOPS (FP16 Tensor Core)")
 
     # --- 序列长度缩放 ---
     print(f"\n[序列长度缩放]  B=16, H={H}, D={D}, sparsity={sparsity}")
