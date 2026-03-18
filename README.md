@@ -2,7 +2,7 @@
 
 针对**短序列（<1K tokens）+ 高稀疏度（~75%）** 场景深度优化的稀疏掩码注意力 CUDA kernel。
 
-经过 23 轮系统性优化，从 16.571ms 优化至 **0.512ms**（**32x 总提速**），在 RTX 3080 上达到 **25.17 TFLOPS / 84.4% MFU**。
+经过 25 轮系统性优化，从 16.571ms 优化至 **0.466ms**（**35.6x 总提速**），在 RTX 3080 上达到 **27.66 TFLOPS / 46.5% MFU**（FP16 Tensor Core 峰值 59.5T 为基准）。
 
 ## 性能对比
 
@@ -10,12 +10,12 @@
 
 | 实现 | 延迟 (ms) | TFLOPS | 加速比 |
 |------|-----------|--------|--------|
-| **Ours** | **0.512** | **25.17** | **baseline** |
-| Triton | 0.751 | 17.15 | 本项目快 1.59x |
-| cuDNN SDPA | 0.892 | 14.45 | 本项目快 1.74x |
-| FlashInfer | 1.082 | 11.91 | 本项目快 2.11x |
-| PyTorch Ref | 2.091 | 6.16 | 本项目快 4.42x |
-| flash-attn (dense) | 0.403 | 31.96 | 差距 1.17x |
+| **Ours** | **0.466** | **27.66** | **baseline** |
+| Triton | 0.751 | 17.15 | 本项目快 1.61x |
+| cuDNN SDPA | 0.892 | 14.44 | 本项目快 1.91x |
+| FlashInfer | 1.086 | 11.86 | 本项目快 2.33x |
+| PyTorch Ref | 2.091 | 6.16 | 本项目快 4.49x |
+| flash-attn (dense) | 0.403 | 31.98 | 差距 1.16x |
 
 > flash-attn 为 dense 实现（无 mask），为理论上界参考。
 
@@ -24,7 +24,7 @@
 ## 核心优化技术
 
 - **Bit-Pack 掩码压缩** — bool mask `[B,H,N,N]` → uint32 `[B,H,N,N/32]`，8x 内存节省
-- **WMMA Tensor Core** — m16n16k16 同时加速 QK^T 和 PV 累加
+- **WMMA + PTX mma Tensor Core** — WMMA m16n16k16 加速 QK^T，PTX `mma.sync.aligned.m16n8k16` 加速 PV（register-resident，无 smem 中转）
 - **寄存器内 Softmax** — 利用 fragment layout（4 lanes/row）+ `__shfl_xor_sync` 跨 lane 归约，消除 smem round-trip
 - **Shared Memory Padding** — 内维度 +8 halves，将 bank conflict 从 16-way 降至 2-way
 - **cp.async 异步加载** — K/V 通过 `cp.async.cg` 走 L2 bypass 路径
@@ -43,7 +43,7 @@ sparse-mask-attention/
 │   ├── sparse_attention.py        # sparse_attention() API + pack_mask()
 │   └── __init__.py
 ├── notes/                         # 优化文档
-│   ├── perf_log.md                # 23 轮逐轮优化记录
+│   ├── perf_log.md                # 25 轮逐轮优化记录
 │   ├── optimization_rules.md      # 优化方法论
 │   ├── gen_chart.py               # 生成性能图表
 │   └── perf_chart.png             # 性能优化图
@@ -103,8 +103,8 @@ Q, K, V [B,H,N,D] + bool mask [B,H,N,N]
 | BN (K/V tile cols) | 64 |
 | Head dim | 64 |
 | Warps/block | 4 (128 threads) |
-| Smem/block | ~37 KB |
-| Occupancy | 2 blocks/SM |
+| Smem/block | ~28 KB |
+| Occupancy | 3 blocks/SM |
 | I/O 精度 | FP16 |
 | 累加精度 | FP32 |
 

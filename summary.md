@@ -6,7 +6,7 @@
 
 **目标：** 编写一个能够跳过全掩码 K/V 块的稀疏注意力 CUDA kernel，在 RTX 3080 上超越 Triton 实现，并与 FlashAttention、cuDNN SDPA、FlashInfer 等主流实现进行对比。
 
-**最终成果：** 从基线 16.571ms 优化至 0.512ms，**总提速 32x**，比 Triton 快 **1.59x**。
+**最终成果：** 从基线 16.571ms 优化至 0.466ms，**总提速 35.6x**，比 Triton 快 **1.61x**。
 
 ---
 
@@ -98,6 +98,23 @@ WMMA fragment layout 在 sm_86 上的列偏移为 `col_off={0,1,0,1,8,9,8,9}`，
 | R21 | 2-lane softmax（每行 2 线程并行，减半 expf 调用） | 0.583ms | 1.02x |
 | R22 | 合并 sc[]/pv[] 数组，节省 32 个 float 寄存器 | 0.571ms | 1.02x |
 
+---
+
+### 第四阶段：寄存器内 Softmax + PTX mma（R23–R25）
+
+**核心思路：** 消除 softmax 的 smem round-trip，将 PV 乘法从 WMMA 改为 PTX mma 直接操作寄存器，彻底消除 smem_p 缓冲。
+
+| 轮次 | 描述 | 延迟 | 相对上轮提速 |
+|------|------|------|-------------|
+| R23 | 寄存器内 softmax（__shfl_xor 跨 lane 归约） | 0.512ms | **1.12x** |
+| R25 | PTX mma PV（消除 smem_p，register-resident P×V） | 0.466ms | **1.10x** |
+
+**R23 关键突破：** 利用 WMMA accumulator fragment 的确定性 lane 布局（row = lane/4, 4 lanes/row），用 `__shfl_xor_sync` 跨 4 lanes 归约 max/sum，完全消除 smem_max/smem_sum/smem_rsc 缓冲。
+
+**R25 关键突破：** 将 PV 乘法从 WMMA `mma_sync` 改为 PTX `mma.sync.aligned.m16n8k16.row.col`，softmax 后的 P 矩阵直接从 WMMA accumulator 寄存器打包为 PTX mma A 操作数，无需写入 smem_p。消除了 smem_p[4][16][72]（~9.2KB），共享内存从 ~37KB 降至 ~28KB，理论上可达 3 blocks/SM（原 2 blocks/SM）。
+
+**PTX mma 寄存器布局（sm_86 实测）：** A 操作数的 a[1]/a[2] 寄存器与常见文档描述相反（a[1] 对应 rows 8-15/k 0-7 而非 rows 0-7/k 8-15），需要通过实验验证。
+
 **R14 关键突破：** 正确实现 WMMA PV 需要处理 4×4=16 个 fragment tile（BN=16, HD=64 各需 4 个 m16n16k16 tile），fragment 的 row/col 映射需要精确匹配 sm_86 的物理 layout。实现正确后获得 1.68x 提速，是本阶段最大单步收益。
 
 **R19 关键突破：** smem bank conflict 分析：
@@ -110,7 +127,7 @@ WMMA fragment layout 在 sm_86 上的列偏移为 `col_off={0,1,0,1,8,9,8,9}`，
 
 - **R16（NWARPS 4→8）：** smem 从 20KB 增至 32KB，每 SM 可容纳的 block 数从 2 降至 1，occupancy 下降，延迟反升至 1.129ms
 - **R17（cp.async 真双缓冲）：** 双缓冲需要额外的 `__syncthreads()` 同步，开销抵消了预取收益，延迟 1.064ms（持平）
-- **K/V 双缓冲（smem 37→57KB）：** occupancy 从 2→1 blocks/SM，严重退化
+- **K/V 双缓冲（smem 翻倍）：** occupancy 下降，严重退化
 - **去除 sparse skip：** 75% random sparsity + BN=64 下全零 tile 极少，几乎无效
 
 ---
@@ -131,7 +148,7 @@ sm_86 的 WMMA m16n16k16 fragment layout 与部分文档描述存在差异，需
 
 ### 4. 双缓冲的适用条件
 
-双缓冲（double buffering）需要满足：smem 增量不导致 occupancy 下降，且预取收益大于额外同步开销。在 smem 已接近上限（37KB）时，双缓冲将 smem 翻倍至 55KB+，每 SM block 数从 2 降至 1，净效果为负。
+双缓冲（double buffering）需要满足：smem 增量不导致 occupancy 下降，且预取收益大于额外同步开销。当 smem 已较大时，双缓冲将其翻倍，每 SM block 数可能减少，净效果为负。
 
 ### 5. 稀疏跳过的粒度权衡
 
@@ -145,12 +162,12 @@ BN（K/V tile 大小）越小，稀疏跳过越精细，但循环开销越大；
 
 | 实现 | 延迟 | TFLOPS | 相对本项目 |
 |------|------|--------|-----------|
-| **本项目（R23）** | **0.512ms** | **25.17** | **1.00x（基准）** |
-| Triton | 0.751ms | 17.15 | 0.66x（本项目快 1.59x） |
-| cuDNN SDPA | 0.892ms | 14.45 | 0.57x（本项目快 1.74x） |
-| FlashInfer | 1.082ms | 11.91 | 0.47x（本项目快 2.11x） |
-| PyTorch 参考实现 | 2.091ms | 6.16 | 0.24x（本项目快 4.42x） |
-| flash-attn（dense，无 mask） | 0.403ms | 31.96 | 1.27x（dense 上界） |
+| **本项目（R25）** | **0.466ms** | **27.66** | **1.00x（基准）** |
+| Triton | 0.751ms | 17.15 | 0.62x（本项目快 1.61x） |
+| cuDNN SDPA | 0.892ms | 14.44 | 0.52x（本项目快 1.91x） |
+| FlashInfer | 1.086ms | 11.86 | 0.43x（本项目快 2.33x） |
+| PyTorch 参考实现 | 2.091ms | 6.16 | 0.22x（本项目快 4.49x） |
+| flash-attn（dense，无 mask） | 0.403ms | 31.98 | 1.16x（dense 上界） |
 
 > 注：flash-attn 为 dense 实现，不处理稀疏掩码，为理论上界参考。
 
@@ -160,8 +177,9 @@ BN（K/V tile 大小）越小，稀疏跳过越精细，但循环开销越大；
 |------|------|------|---------|
 | 第一阶段（标量优化） | 16.571ms | 3.247ms | 5.1x |
 | 第二阶段（WMMA QK^T） | 3.673ms（FP16 重置） | 1.763ms | 2.1x |
-| 第三阶段（WMMA 全覆盖 + 访存优化） | 1.046ms | 0.512ms | 2.04x |
-| **总计** | **16.571ms** | **0.512ms** | **32x** |
+| 第三阶段（WMMA 全覆盖 + 访存优化） | 1.046ms | 0.571ms | 1.83x |
+| 第四阶段（寄存器 Softmax + PTX mma） | 0.512ms | 0.466ms | 1.10x |
+| **总计** | **16.571ms** | **0.466ms** | **35.6x** |
 
 ---
 
@@ -177,19 +195,20 @@ BN（K/V tile 大小）越小，稀疏跳过越精细，但循环开销越大；
 
 根据 ncu profile（R19 后）：
 
-- **TC util 22.5%**：Tensor Core 利用率偏低
-- **occupancy 16.3%**：每 SM 仅 2 个 block（smem 37KB 限制）
-- **wait stall 1.58**：TC pipeline bubble，是当前主要瓶颈
+- **MFU 46.5%**（vs FP16 TC 峰值 59.5 TFLOPS），还有约一半空间
+- **occupancy**：smem ~28KB/block，理论 3 blocks/SM
+- 距离 flash-attn (dense) 仅差 1.16x
 
 后续可探索方向：
-1. Software pipelining：在 WMMA compute 时预加载下一 tile 的 K/V（需解决 smem 限制）
-2. 减少 softmax 标量操作（BN=64 时有 64 个 expf/fmax 调用）
-3. 探索 warp-level 并行 softmax 进一步减少串行开销
+1. QK^T 也改为 PTX mma（当前仅 PV 用 PTX mma，QK^T 仍用 WMMA）
+2. Software pipelining：在 compute 时预加载下一 tile 的 K/V
+3. 不同 tile 策略（BM/BN/HD 组合优化）
+4. 利用 smem 减少后的空间探索 double buffering
 
 ---
 
 ## 总结
 
-本项目通过 23 轮系统性优化，将稀疏掩码注意力 kernel 从 16.571ms 优化至 0.512ms（**32x 总提速**），在 RTX 3080 上达到 25.17 TFLOPS（84.4% MFU），比 Triton 快 **1.59x**，比 cuDNN SDPA 快 **1.74x**，比 FlashInfer 快 **2.11x**。
+本项目通过 25 轮系统性优化，将稀疏掩码注意力 kernel 从 16.571ms 优化至 0.466ms（**35.6x 总提速**），在 RTX 3080 上达到 27.66 TFLOPS（46.5% MFU，FP16 Tensor Core 峰值 59.5T 为基准），比 Triton 快 **1.61x**，比 cuDNN SDPA 快 **1.91x**，比 FlashInfer 快 **2.33x**。
 
-核心优化路径：消除寄存器溢出 → 多 warp 提升 occupancy → WMMA Tensor Core 加速 → smem padding 消除 bank conflict → 寄存器内 softmax 消除 smem round-trip。每一步都有明确的性能模型支撑，失败尝试也提供了宝贵的反向验证。
+核心优化路径：消除寄存器溢出 → 多 warp 提升 occupancy → WMMA Tensor Core 加速 → smem padding 消除 bank conflict → 寄存器内 softmax 消除 smem round-trip → PTX mma 消除 smem_p 中转。每一步都有明确的性能模型支撑，失败尝试也提供了宝贵的反向验证。
